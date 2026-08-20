@@ -1,0 +1,2 @@
+The identity schema is provisioned before Alembic runs. Alembic owns only the
+versioned tables, constraints, and indexes inside that schema.
