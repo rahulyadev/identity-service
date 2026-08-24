@@ -47,6 +47,21 @@ multiple hosts, and Unix-domain sockets are rejected before engine creation. No 
 database connection occurs during settings validation. The Unix-socket relaxation is limited to
 deliberately configured local/test operation.
 
+## Authenticated profile operations
+
+`PUT /v1/me` verifies `profile.write` and `openid`, calls UserInfo with the same access token, and
+atomically initializes or synchronizes the exact issuer/subject identity. `GET /v1/me` verifies
+`profile.read` and reads PostgreSQL only. `PATCH /v1/me` verifies `profile.write`, requires
+`application/merge-patch+json` plus one strong `If-Match: "vN"`, and atomically changes only the
+display-name override. A same-value PATCH is an idempotent no-op; competing requests using one ETag
+produce one update and version conflicts for the remaining requests.
+
+All successful responses expose the minimal external representation and a matching strong ETag.
+All exact `/v1/me` responses, including authentication, validation, dependency, and method failures,
+use `Cache-Control: no-store`. PostgreSQL failures become bounded `database_unavailable` problems;
+UserInfo failures do not change identity rows; and UserInfo outages do not prevent ordinary local
+reads. Liveness remains dependency-free.
+
 ## Metrics and logging
 
 When enabled, `/metrics` publishes request counts/duration/status, readiness, database errors, pool
@@ -76,8 +91,9 @@ The local Compose database is PostgreSQL `18.4-bookworm`. Its credentials and ro
 local examples only. `make docker-smoke` starts the database, migrates explicitly, starts the packed
 application, verifies liveness/readiness, database outage and restart recovery, non-root/read-only
 operation, dropped capabilities, no-new-privileges, the runtime-tooling boundary, one application
-process, bounded JWKS outage/stale/rotation recovery against an ephemeral test-only fixture, and
-bounded SIGTERM shutdown. It removes only its own Compose volume afterward.
+process, bounded JWKS outage/stale/rotation recovery against an ephemeral test-only fixture,
+authenticated profile initialization/read/conditional-update behavior, provider and database
+outage separation, and bounded SIGTERM shutdown. It removes only its own Compose volume afterward.
 
 The image health script connects directly to loopback without proxy-environment processing, but
 sends the canonical Host derived from validated `IDENTITY_ORIGIN`. Public `ALLOWED_HOSTS` therefore

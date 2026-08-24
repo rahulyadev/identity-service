@@ -75,13 +75,16 @@ def test_full_security_flow_does_not_log_raw_bearer_or_provider_claims(
     assert verified.key_id_fingerprint not in rendered
 
 
-def test_no_public_bearer_or_identity_route_was_added(
+def test_public_bearer_contract_is_limited_to_the_profile_route(
     settings_factory: Callable[..., Settings],
 ) -> None:
     document = create_app(settings_factory()).openapi()
-    assert set(document["paths"]) == {"/health/live", "/health/ready", "/metrics"}
+    assert set(document["paths"]) == {"/health/live", "/health/ready", "/metrics", "/v1/me"}
+    assert set(document["paths"]["/v1/me"]) == {"put", "get", "patch"}
+    assert set(document["components"]["securitySchemes"]) == {"BearerAuth"}
     rendered = json.dumps(document, sort_keys=True).casefold()
-    for forbidden in ("/v1/me", "authorization", "bearer", "oauth2", "jwt"):
+    assert "bearer" in rendered
+    for forbidden in ("provider_email", "provider_display_name", "raw claims", "client_secret"):
         assert forbidden not in rendered
 
 

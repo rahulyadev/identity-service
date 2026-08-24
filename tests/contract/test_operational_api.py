@@ -479,23 +479,37 @@ def test_metrics_route_can_be_disabled(settings_factory: Callable[..., Settings]
     assert "/metrics" not in app.openapi()["paths"]
 
 
-def test_only_implemented_operational_routes_are_documented(
+def test_only_implemented_operational_and_profile_routes_are_documented(
     settings_factory: Callable[..., Settings],
 ) -> None:
     app = create_app(settings_factory())
     document = app.openapi()
-    assert set(document["paths"]) == {"/health/live", "/health/ready", "/metrics"}
+    assert set(document["paths"]) == {
+        "/health/live",
+        "/health/ready",
+        "/metrics",
+        "/v1/me",
+    }
     operation_ids = {
         operation["operationId"]
         for path in document["paths"].values()
         for operation in path.values()
         if isinstance(operation, dict) and "operationId" in operation
     }
-    assert operation_ids == {"health_live", "health_ready", "metrics"}
+    assert operation_ids == {
+        "health_live",
+        "health_ready",
+        "metrics",
+        "put_current_profile",
+        "get_current_profile",
+        "patch_current_profile",
+    }
 
     with ASGIClient(app) as client:
+        profile = client.get("/v1/me")
+        assert profile.status_code == 401
+        assert profile.json()["code"] == "invalid_token"
         for path in (
-            "/v1/me",
             "/v1/login",
             "/v1/callback",
             "/v1/session",
@@ -506,13 +520,64 @@ def test_only_implemented_operational_routes_are_documented(
             assert response.headers["content-type"] == "application/problem+json"
 
 
-def test_openapi_json_is_serializable_and_contains_no_auth_contract(
+def test_openapi_json_documents_one_strict_http_bearer_contract(
     settings_factory: Callable[..., Settings],
 ) -> None:
-    rendered = json.dumps(create_app(settings_factory()).openapi(), sort_keys=True)
-    assert "oauth" not in rendered.lower()
-    assert "cognito" not in rendered.lower()
-    assert "authorization" not in rendered.lower()
+    document = create_app(settings_factory()).openapi()
+    rendered = json.dumps(document, sort_keys=True)
+    scheme = document["components"]["securitySchemes"]["BearerAuth"]
+    assert scheme["type"] == "http"
+    assert scheme["scheme"] == "bearer"
+    assert scheme["bearerFormat"] == "JWT"
+    for method in ("put", "get", "patch"):
+        assert document["paths"]["/v1/me"][method]["security"] == [{"BearerAuth": []}]
+    for prohibited in ("authorizationUrl", "tokenUrl", "clientSecret"):
+        assert prohibited not in rendered
+
+
+def test_profile_openapi_matches_representation_media_status_and_header_contract(
+    settings_factory: Callable[..., Settings],
+) -> None:
+    document = create_app(settings_factory()).openapi()
+    operations = document["paths"]["/v1/me"]
+    assert set(operations) == {"put", "get", "patch"}
+    profile_schema = document["components"]["schemas"]["ProfileResponse"]
+    assert set(profile_schema["properties"]) == {
+        "user_id",
+        "email",
+        "email_verified",
+        "display_name",
+        "avatar_url",
+        "version",
+        "created_at",
+        "updated_at",
+    }
+    assert set(profile_schema["required"]) == set(profile_schema["properties"])
+    assert profile_schema["properties"]["user_id"]["format"] == "uuid"
+    assert profile_schema["properties"]["version"]["minimum"] == 1
+    assert "requestBody" not in operations["put"]
+    assert set(operations["patch"]["requestBody"]["content"]) == {"application/merge-patch+json"}
+    assert set(operations["put"]["responses"]) == {"200", "201", "400", "401", "403", "503"}
+    assert set(operations["get"]["responses"]) == {"200", "401", "403", "404", "503"}
+    assert set(operations["patch"]["responses"]) == {
+        "200",
+        "400",
+        "401",
+        "403",
+        "404",
+        "412",
+        "415",
+        "422",
+        "428",
+        "503",
+    }
+    for method in ("put", "get", "patch"):
+        success = operations[method]["responses"]["200"]
+        assert set(success["headers"]) == {"ETag", "Cache-Control"}
+    assert set(operations["put"]["responses"]["201"]["headers"]) == {
+        "ETag",
+        "Cache-Control",
+    }
 
 
 def _resolve_schema(document: dict[str, Any], schema: dict[str, Any]) -> dict[str, Any]:
@@ -590,7 +655,7 @@ def test_openapi_response_schemas_match_live_responses(
     assert unavailable.json()["code"] == "not_ready"
     assert "error_code" not in unavailable.json()
     rendered = json.dumps(document, sort_keys=True).lower()
-    for absent in ("/v1/me", "oauth", "cognito", "jwt", "jwks", "bearer", "session"):
+    for absent in ("provider_email", "provider_display_name", "subject", "client_id"):
         assert absent not in rendered
 
 

@@ -2,12 +2,12 @@
 
 Identity service to store user data. The service provides a PostgreSQL identity model, a
 concurrency-safe internal identity/profile service, strict Cognito access-token verification, a
-bounded JWKS cache, a subject-bound UserInfo adapter, operational HTTP endpoints, migrations,
-observability, local containers, and automated checks.
+bounded JWKS cache, a subject-bound UserInfo adapter, an authenticated profile HTTP API,
+operational endpoints, migrations, observability, local containers, and automated checks.
 
-The security core is internal and reusable; no bearer-authenticated application route consumes it
-yet. The service does not provide Google token validation, browser login, callback, session,
-cookie, logout, or a `/v1/me` endpoint. The only HTTP surface remains operational.
+The service does not provide Google token validation, browser login, callback, session, cookie, or
+logout behavior. Bearer-authenticated profile access is intended for server-side consumers; direct
+browser integration remains unsupported.
 
 ## Current contract
 
@@ -18,8 +18,11 @@ cookie, logout, or a `/v1/me` endpoint. The only HTTP surface remains operationa
 - PostgreSQL is authoritative. Redis is not used.
 - Provider-owned profile fields are replaced by the latest supplied internal snapshot; omitted
   optional fields are cleared. A user-owned display-name override is preserved.
-- The internal service rejects disabled and deleted users. There is no public deletion or export
-  API or deletion/scrubbing workflow.
+- `PUT /v1/me` initializes or synchronizes the exact authenticated identity through UserInfo.
+- `GET /v1/me` reads only the local profile. `PATCH /v1/me` conditionally updates only the
+  display-name override using a strong profile-version ETag.
+- Disabled and deleted users are unavailable. There is no public deletion or export API or
+  deletion/scrubbing workflow.
 
 See [architecture](docs/architecture.md), [data model](docs/data-model.md),
 [security](docs/security.md), [migrations](docs/migrations.md), and
@@ -119,6 +122,9 @@ image-level SBOM.
 | `GET` | `/health/ready` | `200` only when PostgreSQL is reachable, the one stored Alembic revision equals the packaged head, and the bounded Cognito JWKS cache is usable; otherwise safe `503`. |
 | `GET` | `/metrics` | Prometheus metrics when `METRICS_ENABLED=true`; intended for infrastructure-restricted access. |
 | `GET` | `/openapi.json` | Generated OpenAPI document. |
+| `PUT` | `/v1/me` | Initialize or synchronize the authenticated identity; requires `profile.write` and `openid`. |
+| `GET` | `/v1/me` | Read the authenticated local profile; requires `profile.read` and never calls UserInfo. |
+| `PATCH` | `/v1/me` | Conditionally set or clear `display_name`; requires `profile.write`, merge-patch JSON, and `If-Match: "vN"`. |
 
 Swagger UI and ReDoc may be enabled only in local/test environments and are forbidden in deployed
 development, staging, and production. Their local HTML uses the default external static assets and
@@ -130,6 +136,12 @@ Every failure body uses `application/problem+json` and the public fields `type`,
 `detail`, `request_id`, and `code`. Stable `code` examples include `not_ready`, `body_too_large`,
 and `internal_error`. The internal structured-log field remains `error_code`; it is not part of the
 HTTP contract.
+
+Successful profile representations contain exactly `user_id`, `email`, `email_verified`,
+`display_name`, `avatar_url`, `version`, `created_at`, and `updated_at`. Every profile success has
+`ETag: "vN"`, and every response on the exact `/v1/me` path has `Cache-Control: no-store`.
+Authentication and scope failures use fixed Bearer challenges. Missing, malformed, and stale PATCH
+preconditions are distinct `428`, `400`, and `412` problems. The API has no CORS middleware.
 
 ## Configuration
 

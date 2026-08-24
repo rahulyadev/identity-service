@@ -13,7 +13,12 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.responses import Response
 
 from identity_service.api.middleware import OperationalMiddleware, get_request_id
-from identity_service.api.problems import status_problem
+from identity_service.api.problems import (
+    PublicProblemError,
+    public_problem_response,
+    status_problem,
+)
+from identity_service.api.profile import router as profile_router
 from identity_service.api.routes import router
 from identity_service.config import Settings
 from identity_service.db import build_engine, build_session_factory
@@ -24,6 +29,7 @@ from identity_service.security import (
     JwksCache,
     UpstreamHttpClient,
 )
+from identity_service.services import IdentityProfileService
 
 
 def create_app(
@@ -46,6 +52,9 @@ def create_app(
         jwks_cache = JwksCache(resolved, upstream_client, metrics=metrics, **jwks_options)
         app.state.engine = engine
         app.state.session_factory = build_session_factory(engine)
+        app.state.identity_profile_service = IdentityProfileService(
+            app.state.session_factory, metrics=metrics
+        )
         app.state.upstream_http_client = upstream_client
         app.state.jwks_cache = jwks_cache
         app.state.access_token_verifier = AccessTokenVerifier(resolved, jwks_cache, metrics=metrics)
@@ -65,10 +74,10 @@ def create_app(
     redoc_url = "/redoc" if resolved.enable_interactive_docs else None
     app = FastAPI(
         title="identity-service",
-        summary="Operational foundation for internal identity data",
+        summary="Authenticated identity profile service",
         description=(
-            "The service currently exposes operational endpoints only. It does not provide "
-            "authentication or profile HTTP endpoints."
+            "The service exposes operational endpoints and an authenticated v1 profile API. "
+            "Browser login, sessions, and direct browser integration remain outside this service."
         ),
         version=resolved.service_version,
         docs_url=docs_url,
@@ -81,6 +90,11 @@ def create_app(
     app.state.metrics = metrics
     app.add_middleware(OperationalMiddleware, settings=resolved, metrics=metrics)
     app.include_router(router if resolved.metrics_enabled else _router_without_metrics())
+    app.include_router(profile_router)
+
+    @app.exception_handler(PublicProblemError)
+    async def public_problem_handler(request: Request, error: PublicProblemError) -> Response:
+        return public_problem_response(error, get_request_id(request.scope))
 
     @app.exception_handler(StarletteHTTPException)
     async def http_exception_handler(request: Request, error: StarletteHTTPException) -> Response:

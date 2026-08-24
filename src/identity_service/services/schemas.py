@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import uuid
+from dataclasses import dataclass
 from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, StrictBool, StrictStr, field_validator, model_validator
@@ -100,3 +101,9 @@ class ProfileView(BaseModel):
             created_at=profile.created_at,
             updated_at=profile.updated_at,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class BootstrapProfileResult:
+    profile: ProfileView
+    created: bool

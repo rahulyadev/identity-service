@@ -166,6 +166,8 @@ class OperationalMiddleware:
             )
         if self.settings.deployed_environment:
             headers.append((b"strict-transport-security", b"max-age=31536000; includeSubDomains"))
+        if path == "/v1/me":
+            headers.append((b"cache-control", b"no-store"))
         return headers
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
@@ -258,6 +260,7 @@ class OperationalMiddleware:
                 status = CLIENT_DISCONNECTED_STATUS
                 return
 
+            scope["identity_service.body"] = body
             await self.app(scope, _replay_body(body, receive), secure_send)
         except Exception as error:
             if response_started:

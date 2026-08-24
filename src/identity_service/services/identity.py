@@ -20,6 +20,7 @@ from identity_service.services.errors import (
     VersionConflictError,
 )
 from identity_service.services.schemas import (
+    BootstrapProfileResult,
     ProfileView,
     ProviderIdentityInput,
     ProviderProfileInput,
@@ -86,6 +87,13 @@ class IdentityProfileService:
         provider_identity: ProviderIdentityInput,
         provider_profile: ProviderProfileInput,
     ) -> ProfileView:
+        return self.bootstrap_identity_result(provider_identity, provider_profile).profile
+
+    def bootstrap_identity_result(
+        self,
+        provider_identity: ProviderIdentityInput,
+        provider_profile: ProviderProfileInput,
+    ) -> BootstrapProfileResult:
         outcome = "error"
         try:
             with self._session_factory() as session, session.begin():
@@ -117,6 +125,7 @@ class IdentityProfileService:
                         now=now,
                     )
                     outcome = "created"
+                    created = True
                 else:
                     provider, user, profile = row._tuple()
                     self._require_active(user)
@@ -129,10 +138,11 @@ class IdentityProfileService:
                     )
                     session.flush()
                     outcome = "updated" if changed else "unchanged"
+                    created = False
 
                 result = ProfileView.from_profile(profile)
             self._record_bootstrap(outcome)
-            return result
+            return BootstrapProfileResult(profile=result, created=created)
         except UserUnavailableError:
             self._record_bootstrap("rejected")
             raise

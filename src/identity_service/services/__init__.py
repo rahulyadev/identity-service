@@ -1,4 +1,4 @@
-"""Internal identity/profile operations; no HTTP profile routes are exposed."""
+"""Internal identity/profile operations used by the authenticated HTTP adapter."""
 
 from identity_service.services.errors import (
     IdentityNotFoundError,
@@ -7,12 +7,14 @@ from identity_service.services.errors import (
 )
 from identity_service.services.identity import IdentityProfileService
 from identity_service.services.schemas import (
+    BootstrapProfileResult,
     ProfileView,
     ProviderIdentityInput,
     ProviderProfileInput,
 )
 
 __all__ = [
+    "BootstrapProfileResult",
     "IdentityNotFoundError",
     "IdentityProfileService",
     "ProfileView",

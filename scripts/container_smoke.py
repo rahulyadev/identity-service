@@ -113,7 +113,11 @@ def run(
 
 
 def request_json(
-    path: str, *, headers: dict[str, str] | None = None
+    path: str,
+    *,
+    method: str = "GET",
+    headers: dict[str, str] | None = None,
+    body: bytes | None = None,
 ) -> tuple[int, dict[str, object], dict[str, str]]:
     if path not in SMOKE_JSON_PATHS:
         raise ValueError("unsupported smoke-test endpoint")
@@ -121,7 +125,7 @@ def request_json(
     try:
         request_headers = {"Host": CANONICAL_HOST}
         request_headers.update(headers or {})
-        connection.request("GET", path, headers=request_headers)
+        connection.request(method, path, body=body, headers=request_headers)
         response = connection.getresponse()
         payload = json.load(response)
         response_headers = {key.lower(): value for key, value in response.getheaders()}
@@ -650,6 +654,175 @@ def verify_packed_jwks_outage_and_recovery(fake_cognito: FakeCognito) -> None:
     )
 
 
+def _require_profile_response(
+    status: int,
+    payload: dict[str, object],
+    headers: dict[str, str],
+    *,
+    expected_status: int,
+    expected_version: int,
+) -> None:
+    expected_fields = {
+        "user_id",
+        "email",
+        "email_verified",
+        "display_name",
+        "avatar_url",
+        "version",
+        "created_at",
+        "updated_at",
+    }
+    if status != expected_status or set(payload) != expected_fields:
+        raise RuntimeError("packed profile success representation is incorrect")
+    if payload.get("version") != expected_version:
+        raise RuntimeError("packed profile version is incorrect")
+    if headers.get("etag") != f'"v{expected_version}"':
+        raise RuntimeError("packed profile ETag is incorrect")
+    if headers.get("cache-control") != "no-store":
+        raise RuntimeError("packed profile success omitted no-store")
+
+
+def _require_profile_problem(
+    status: int,
+    payload: dict[str, object],
+    headers: dict[str, str],
+    *,
+    expected_status: int,
+    expected_code: str,
+) -> None:
+    if status != expected_status or payload.get("code") != expected_code:
+        raise RuntimeError("packed profile failure contract is incorrect")
+    if headers.get("cache-control") != "no-store":
+        raise RuntimeError("packed profile failure omitted no-store")
+    if not headers.get("content-type", "").startswith("application/problem+json"):
+        raise RuntimeError("packed profile failure omitted problem media type")
+
+
+def verify_authenticated_profile_api(fake_cognito: FakeCognito) -> None:
+    token = fake_cognito.token()
+    authorization = {"Authorization": f"Bearer {token}"}
+    created_status, created, created_headers = request_json(
+        "/v1/me", method="PUT", headers=authorization
+    )
+    _require_profile_response(
+        created_status,
+        created,
+        created_headers,
+        expected_status=201,
+        expected_version=1,
+    )
+
+    userinfo_fetches = fake_cognito.userinfo_fetches
+    get_status, local, get_headers = request_json("/v1/me", headers=authorization)
+    _require_profile_response(
+        get_status, local, get_headers, expected_status=200, expected_version=1
+    )
+    if local != created or fake_cognito.userinfo_fetches != userinfo_fetches:
+        raise RuntimeError("packed local profile read called UserInfo or changed representation")
+
+    patch_status, patched, patch_headers = request_json(
+        "/v1/me",
+        method="PATCH",
+        headers={
+            **authorization,
+            "Content-Type": "application/merge-patch+json",
+            "If-Match": '"v1"',
+        },
+        body=b'{"display_name":"Packed Local"}',
+    )
+    _require_profile_response(
+        patch_status, patched, patch_headers, expected_status=200, expected_version=2
+    )
+    if patched.get("display_name") != "Packed Local":
+        raise RuntimeError("packed profile override was not applied")
+
+    stale_status, stale, stale_headers = request_json(
+        "/v1/me",
+        method="PATCH",
+        headers={
+            **authorization,
+            "Content-Type": "application/merge-patch+json",
+            "If-Match": '"v1"',
+        },
+        body=b'{"display_name":"Stale"}',
+    )
+    _require_profile_problem(
+        stale_status,
+        stale,
+        stale_headers,
+        expected_status=412,
+        expected_code="profile_version_conflict",
+    )
+
+    fake_cognito.userinfo_status = 429
+    provider_status, provider, provider_headers = request_json(
+        "/v1/me", method="PUT", headers=authorization
+    )
+    _require_profile_problem(
+        provider_status,
+        provider,
+        provider_headers,
+        expected_status=503,
+        expected_code="provider_unavailable",
+    )
+    if provider_headers.get("retry-after") != "30":
+        raise RuntimeError("packed provider failure omitted bounded Retry-After")
+
+    outage_fetches = fake_cognito.userinfo_fetches
+    outage_read_status, outage_read, outage_read_headers = request_json(
+        "/v1/me", headers=authorization
+    )
+    _require_profile_response(
+        outage_read_status,
+        outage_read,
+        outage_read_headers,
+        expected_status=200,
+        expected_version=2,
+    )
+    if fake_cognito.userinfo_fetches != outage_fetches:
+        raise RuntimeError("packed local read contacted unavailable UserInfo")
+
+    fake_cognito.userinfo_status = 401
+    rejected_status, rejected, rejected_headers = request_json(
+        "/v1/me", method="PUT", headers=authorization
+    )
+    _require_profile_problem(
+        rejected_status,
+        rejected,
+        rejected_headers,
+        expected_status=401,
+        expected_code="invalid_token",
+    )
+    if rejected_headers.get("www-authenticate") != (
+        'Bearer realm="identity", error="invalid_token"'
+    ):
+        raise RuntimeError("packed UserInfo token rejection omitted fixed challenge")
+    fake_cognito.userinfo_status = 200
+
+    unauthenticated_status, unauthenticated, unauthenticated_headers = request_json(
+        "/v1/me",
+        method="PATCH",
+        headers={"Content-Type": "text/plain"},
+        body=b"invalid",
+    )
+    _require_profile_problem(
+        unauthenticated_status,
+        unauthenticated,
+        unauthenticated_headers,
+        expected_status=401,
+        expected_code="invalid_token",
+    )
+    if "access-control-allow-origin" in unauthenticated_headers:
+        raise RuntimeError("packed profile route unexpectedly enabled CORS")
+
+    print(
+        "packed authenticated profile API passed: "
+        "put_create=201 get_local=200 patch=200 stale=412 "
+        "provider_outage=503 provider_read=200 token_rejection=401 "
+        "authentication_precedence=true etag=true no_store=true no_cors=true"
+    )
+
+
 def main() -> int:
     fake_cognito = FakeCognito()
     fake_server = FakeCognitoServer(fake_cognito)
@@ -666,7 +839,19 @@ def main() -> int:
         run("docker", "compose", "run", "--rm", "migrate")
         run("docker", "compose", "up", "-d", "--wait", "app")
         wait_for_json("/health/live", "alive")
+        unavailable_status, unavailable, unavailable_headers = request_json(
+            "/v1/me",
+            headers={"Authorization": f"Bearer {fake_cognito.token()}"},
+        )
+        _require_profile_problem(
+            unavailable_status,
+            unavailable,
+            unavailable_headers,
+            expected_status=503,
+            expected_code="authentication_unavailable",
+        )
         verify_packed_jwks_outage_and_recovery(fake_cognito)
+        verify_authenticated_profile_api(fake_cognito)
 
         container_id = run("docker", "compose", "ps", "-q", "app", capture=True)
         if not container_id:
@@ -850,10 +1035,10 @@ def main() -> int:
             "/health/live",
             "/health/ready",
             "/metrics",
+            "/v1/me",
         }:
             raise RuntimeError("packed OpenAPI contains an unexpected route surface")
         for absent_path in (
-            "/v1/me",
             "/v1/login",
             "/v1/callback",
             "/v1/refresh",
@@ -891,6 +1076,29 @@ def main() -> int:
         wait_for_json("/health/live", "alive")
         run("docker", "compose", "exec", "-T", "app", "python", "scripts/healthcheck.py")
         wait_for_json("/health/ready", 503, expected_http_status=503)
+        outage_token = fake_cognito.token()
+        database_get_status, database_get, database_get_headers = request_json(
+            "/v1/me", headers={"Authorization": f"Bearer {outage_token}"}
+        )
+        _require_profile_problem(
+            database_get_status,
+            database_get,
+            database_get_headers,
+            expected_status=503,
+            expected_code="database_unavailable",
+        )
+        database_put_status, database_put, database_put_headers = request_json(
+            "/v1/me",
+            method="PUT",
+            headers={"Authorization": f"Bearer {outage_token}"},
+        )
+        _require_profile_problem(
+            database_put_status,
+            database_put,
+            database_put_headers,
+            expected_status=503,
+            expected_code="database_unavailable",
+        )
         run("docker", "compose", "up", "-d", "--wait", "db")
         wait_for_json("/health/ready", "ready")
 
@@ -937,6 +1145,7 @@ def main() -> int:
             "cap_drop=ALL no_new_privileges=true app_processes=1 "
             "runtime_security_dependencies=true fixture_excluded=true private_keys_absent=true "
             f"canonical_health_host=true loopback_host_rejected=true outage_recovery=true "
+            "authenticated_profile_e2e=true database_profile_outage=true "
             f"startup_redaction=true raw_http_cases={len(raw_outcomes)} "
             f"deployed_json_logging=true json_shutdown_exit={json_shutdown_exit} "
             f"json_shutdown_seconds={json_shutdown_seconds:.3f} "

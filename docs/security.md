@@ -42,6 +42,13 @@
   `Retry-After`, and rejects Unicode control characters in profile claims. JWKS cache freshness
   parsing bounds `Cache-Control` numeric input and never exceeds the configured maximum.
 - Verified-token `repr` and `str` output are redacted even if an object is logged accidentally.
+- The `/v1/me` adapter authenticates and authorizes before route-specific validation, requires exact
+  UserInfo subject binding for synchronization, and keeps synchronous provider/database work off the
+  event loop. It exposes only the stable UUID and minimal effective profile representation.
+- Profile writes use a strict strong ETag, duplicate-sensitive header and JSON parsing, one allowed
+  merge-patch member, and atomic optimistic versioning. Every exact profile-path response uses
+  `no-store`; fixed Bearer challenges and bounded `Retry-After`/`Allow` values are the only preserved
+  failure headers. No CORS middleware is enabled.
 
 The metrics endpoint is unauthenticated and must be restricted by infrastructure. There is no CORS
 middleware and direct browser access is unsupported.
@@ -64,9 +71,9 @@ deployed configuration can select its HTTP/loopback endpoints.
 
 ## Not implemented
 
-There is no authenticated HTTP profile endpoint, Google token validation, OAuth authorization code
-flow, PKCE, state, nonce, callback, refresh, logout, cookie, session, `/v1/me`, account linking,
-username and password, public deletion/export, or production authentication bypass/mock.
+There is no Google token validation, OAuth authorization code flow, PKCE, state, nonce, callback,
+refresh, logout, cookie, session, account linking, username and password, public deletion/export, or
+production authentication bypass/mock.
 
 No token, authorization code, provider claim document, password, browser session, business role, or
 permission is persisted. Logs omit authorization/cookie headers, tokens, provider identifiers,

@@ -8,7 +8,8 @@ psycopg 3 persistence layer. The package uses a compact `src/identity_service` l
 - `models` defines the authoritative `identity` schema mapping.
 - `services` owns internal identity bootstrap, profile read, and display-name update transactions.
 - `db` creates lazy engines/sessions and checks the packaged migration revision.
-- `api` exposes operational routes and request-boundary middleware.
+- `api` exposes operational routes, the authenticated v1 profile adapter, and request-boundary
+  middleware.
 - `observability` centralizes bounded metrics and the shared redacted application/Uvicorn logging
   pipeline.
 - `security` owns the fixed-RS256 access-token verifier, single-flight bounded JWKS cache, shared
@@ -25,10 +26,12 @@ synchronous SQLAlchemy must retain an equivalent thread-pool boundary.
 
 ## Identity flow
 
-The internal security core validates a Cognito access token and binds a bounded UserInfo profile to
-the token's exact subject. That result can supply strict `ProviderIdentityInput` and
-`ProviderProfileInput` values to `bootstrap_identity`. The service does not expose this flow or any
-identity/profile operation through HTTP.
+The profile HTTP adapter validates a Cognito access token before route-specific input, then binds a
+bounded UserInfo profile to the token's exact subject for `PUT /v1/me`. It supplies strict
+`ProviderIdentityInput` and `ProviderProfileInput` values to the existing transactional service.
+`GET /v1/me` resolves the exact verified issuer/subject locally and never calls UserInfo.
+`PATCH /v1/me` parses a strict profile ETag and duplicate-sensitive merge-patch document before
+calling the existing atomic display-name update.
 
 Bootstrap derives a signed 64-bit PostgreSQL advisory-lock key from the first eight bytes of
 `SHA-256(issuer UTF-8 + NUL + subject UTF-8)`. It takes a transaction-scoped advisory lock, re-queries
@@ -37,8 +40,9 @@ constraint remains the final correctness backstop.
 
 The single process owns one synchronous, no-proxy/no-redirect upstream HTTP client. Application
 startup remains network-independent; readiness may perform a bounded JWKS fetch on a worker thread.
-The application has no Redis, background worker, event bus, browser state, roles/permissions model,
-or generic administration surface.
+Profile authentication, UserInfo, and PostgreSQL route work uses synchronous FastAPI path operations
+and therefore remains in the framework worker pool. The application has no Redis, background worker,
+event bus, browser state, roles/permissions model, or generic administration surface.
 
 ## Cognito trust boundary
 
