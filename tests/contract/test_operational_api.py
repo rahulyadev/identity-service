@@ -557,6 +557,30 @@ def test_profile_openapi_matches_representation_media_status_and_header_contract
     assert profile_schema["properties"]["version"]["minimum"] == 1
     assert "requestBody" not in operations["put"]
     assert set(operations["patch"]["requestBody"]["content"]) == {"application/merge-patch+json"}
+    parameters = operations["patch"]["parameters"]
+    assert len(parameters) == 1
+    if_match = parameters[0]
+    assert if_match["name"] == "If-Match"
+    assert if_match["in"] == "header"
+    assert if_match["required"] is True
+    assert if_match["schema"] == {
+        "type": "string",
+        "pattern": '^"v[1-9][0-9]*"$',
+        "example": '"v1"',
+    }
+    for required_description in (
+        "positive signed-64-bit integer",
+        "without leading zeros",
+        "Duplicate headers",
+        "weak validators",
+        "wildcards",
+        "lists",
+        "padding",
+        "zero",
+        "negative",
+        "oversized",
+    ):
+        assert required_description in if_match["description"]
     assert set(operations["put"]["responses"]) == {"200", "201", "400", "401", "403", "503"}
     assert set(operations["get"]["responses"]) == {"200", "401", "403", "404", "503"}
     assert set(operations["patch"]["responses"]) == {
@@ -578,6 +602,40 @@ def test_profile_openapi_matches_representation_media_status_and_header_contract
         "ETag",
         "Cache-Control",
     }
+    for operation in operations.values():
+        for status, documented_response in operation["responses"].items():
+            headers = documented_response["headers"]
+            assert "Cache-Control" in headers
+            cache_control = headers["Cache-Control"]
+            assert cache_control["schema"]["const"] == "no-store"
+            assert "Always present" in cache_control["description"]
+            if status == "401":
+                assert set(headers) == {"Cache-Control", "WWW-Authenticate"}
+                challenge = headers["WWW-Authenticate"]
+                assert challenge["schema"]["const"] == (
+                    'Bearer realm="identity", error="invalid_token"'
+                )
+                assert "Always present" in challenge["description"]
+            elif status == "403":
+                assert set(headers) == {"Cache-Control", "WWW-Authenticate"}
+                challenge = headers["WWW-Authenticate"]
+                assert challenge["schema"]["const"] == (
+                    'Bearer realm="identity", error="insufficient_scope"'
+                )
+                assert "scope failures" in challenge["description"]
+                assert "absent for `account_unavailable`" in challenge["description"]
+            elif status == "503":
+                assert set(headers) == {"Cache-Control", "Retry-After"}
+                retry_after = headers["Retry-After"]
+                assert retry_after["schema"]["pattern"] == (r"^(?:0|[1-9][0-9]?|[12][0-9]{2}|300)$")
+                assert "Optional" in retry_after["description"]
+                assert "UserInfo rate-limit" in retry_after["description"]
+                assert "0 through 300 seconds" in retry_after["description"]
+                assert "absent for every other 503" in retry_after["description"]
+            elif status == "200" or status == "201":
+                assert set(headers) == {"ETag", "Cache-Control"}
+            else:
+                assert set(headers) == {"Cache-Control"}
 
 
 def _resolve_schema(document: dict[str, Any], schema: dict[str, Any]) -> dict[str, Any]:

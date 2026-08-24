@@ -38,15 +38,46 @@ from identity_service.services.validation import normalize_display_name_override
 router = APIRouter(prefix="/v1", tags=["profile"])
 IF_MATCH_PATTERN = re.compile(r'"v([1-9][0-9]*)"')
 MAX_SIGNED_64_BIT = (1 << 63) - 1
+CACHE_CONTROL_HEADER = {
+    "description": "Always present with the fixed value `no-store` for profile responses.",
+    "schema": {"type": "string", "const": "no-store", "example": "no-store"},
+}
+INVALID_TOKEN_CHALLENGE_HEADER = {
+    "description": "Always present with the fixed bearer challenge for invalid tokens.",
+    "schema": {
+        "type": "string",
+        "const": AUTHENTICATION_FAILURE_CHALLENGE,
+        "example": AUTHENTICATION_FAILURE_CHALLENGE,
+    },
+}
+INSUFFICIENT_SCOPE_CHALLENGE_HEADER = {
+    "description": (
+        "Present with the fixed insufficient-scope bearer challenge for scope failures; "
+        "absent for `account_unavailable`."
+    ),
+    "schema": {
+        "type": "string",
+        "const": INSUFFICIENT_SCOPE_CHALLENGE,
+        "example": INSUFFICIENT_SCOPE_CHALLENGE,
+    },
+}
+RETRY_AFTER_HEADER = {
+    "description": (
+        "Optional. Present only when a validated UserInfo rate-limit response supplies a delay "
+        "from 0 through 300 seconds; absent for every other 503 response."
+    ),
+    "schema": {
+        "type": "string",
+        "pattern": r"^(?:0|[1-9][0-9]?|[12][0-9]{2}|300)$",
+        "example": "30",
+    },
+}
 PROFILE_RESPONSE_HEADERS = {
     "ETag": {
         "description": 'Strong profile version validator in the form `"vN"`.',
         "schema": {"type": "string"},
     },
-    "Cache-Control": {
-        "description": "Always `no-store` for profile responses.",
-        "schema": {"type": "string", "example": "no-store"},
-    },
+    "Cache-Control": CACHE_CONTROL_HEADER,
 }
 
 
@@ -76,17 +107,29 @@ class ProfileResponse(BaseModel):
         )
 
 
-def _problem_response(description: str) -> dict[str, Any]:
+def _problem_response(
+    description: str, *, headers: dict[str, dict[str, Any]] | None = None
+) -> dict[str, Any]:
     return {
         "description": description,
+        "headers": {"Cache-Control": CACHE_CONTROL_HEADER, **(headers or {})},
         "content": {PROBLEM_MEDIA_TYPE: {"schema": ProblemResponse.model_json_schema()}},
     }
 
 
 COMMON_AUTH_RESPONSES: dict[int | str, dict[str, Any]] = {
-    401: _problem_response("Invalid access token"),
-    403: _problem_response("Insufficient scope or unavailable local account"),
-    503: _problem_response("Authentication or profile dependency unavailable"),
+    401: _problem_response(
+        "Invalid access token",
+        headers={"WWW-Authenticate": INVALID_TOKEN_CHALLENGE_HEADER},
+    ),
+    403: _problem_response(
+        "Insufficient scope or unavailable local account",
+        headers={"WWW-Authenticate": INSUFFICIENT_SCOPE_CHALLENGE_HEADER},
+    ),
+    503: _problem_response(
+        "Authentication or profile dependency unavailable",
+        headers={"Retry-After": RETRY_AFTER_HEADER},
+    ),
 }
 
 
@@ -305,6 +348,24 @@ def get_current_profile(
     },
     summary="Conditionally update the display-name override",
     openapi_extra={
+        "parameters": [
+            {
+                "name": "If-Match",
+                "in": "header",
+                "required": True,
+                "description": (
+                    'One strong profile validator in the exact form `"vN"`, where `N` is a '
+                    "positive signed-64-bit integer without leading zeros. Duplicate headers, "
+                    "weak validators, wildcards, lists, padding, zero, negative, and oversized "
+                    "values are rejected."
+                ),
+                "schema": {
+                    "type": "string",
+                    "pattern": '^"v[1-9][0-9]*"$',
+                    "example": '"v1"',
+                },
+            }
+        ],
         "requestBody": {
             "required": True,
             "content": {
@@ -326,7 +387,7 @@ def get_current_profile(
                     }
                 }
             },
-        }
+        },
     },
 )
 def patch_current_profile(

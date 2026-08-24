@@ -244,8 +244,9 @@
             "description": "Current local profile",
             "headers": {
               "Cache-Control": {
-                "description": "Always `no-store` for profile responses.",
+                "description": "Always present with the fixed value `no-store` for profile responses.",
                 "schema": {
+                  "const": "no-store",
                   "example": "no-store",
                   "type": "string"
                 }
@@ -302,7 +303,25 @@
                 }
               }
             },
-            "description": "Invalid access token"
+            "description": "Invalid access token",
+            "headers": {
+              "Cache-Control": {
+                "description": "Always present with the fixed value `no-store` for profile responses.",
+                "schema": {
+                  "const": "no-store",
+                  "example": "no-store",
+                  "type": "string"
+                }
+              },
+              "WWW-Authenticate": {
+                "description": "Always present with the fixed bearer challenge for invalid tokens.",
+                "schema": {
+                  "const": "Bearer realm=\"identity\", error=\"invalid_token\"",
+                  "example": "Bearer realm=\"identity\", error=\"invalid_token\"",
+                  "type": "string"
+                }
+              }
+            }
           },
           "403": {
             "content": {
@@ -348,7 +367,25 @@
                 }
               }
             },
-            "description": "Insufficient scope or unavailable local account"
+            "description": "Insufficient scope or unavailable local account",
+            "headers": {
+              "Cache-Control": {
+                "description": "Always present with the fixed value `no-store` for profile responses.",
+                "schema": {
+                  "const": "no-store",
+                  "example": "no-store",
+                  "type": "string"
+                }
+              },
+              "WWW-Authenticate": {
+                "description": "Present with the fixed insufficient-scope bearer challenge for scope failures; absent for `account_unavailable`.",
+                "schema": {
+                  "const": "Bearer realm=\"identity\", error=\"insufficient_scope\"",
+                  "example": "Bearer realm=\"identity\", error=\"insufficient_scope\"",
+                  "type": "string"
+                }
+              }
+            }
           },
           "404": {
             "content": {
@@ -394,7 +431,17 @@
                 }
               }
             },
-            "description": "The identity has not been initialized"
+            "description": "The identity has not been initialized",
+            "headers": {
+              "Cache-Control": {
+                "description": "Always present with the fixed value `no-store` for profile responses.",
+                "schema": {
+                  "const": "no-store",
+                  "example": "no-store",
+                  "type": "string"
+                }
+              }
+            }
           },
           "503": {
             "content": {
@@ -440,7 +487,25 @@
                 }
               }
             },
-            "description": "Authentication or profile dependency unavailable"
+            "description": "Authentication or profile dependency unavailable",
+            "headers": {
+              "Cache-Control": {
+                "description": "Always present with the fixed value `no-store` for profile responses.",
+                "schema": {
+                  "const": "no-store",
+                  "example": "no-store",
+                  "type": "string"
+                }
+              },
+              "Retry-After": {
+                "description": "Optional. Present only when a validated UserInfo rate-limit response supplies a delay from 0 through 300 seconds; absent for every other 503 response.",
+                "schema": {
+                  "example": "30",
+                  "pattern": "^(?:0|[1-9][0-9]?|[12][0-9]{2}|300)$",
+                  "type": "string"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -455,6 +520,19 @@
       },
       "patch": {
         "operationId": "patch_current_profile",
+        "parameters": [
+          {
+            "description": "One strong profile validator in the exact form `\"vN\"`, where `N` is a positive signed-64-bit integer without leading zeros. Duplicate headers, weak validators, wildcards, lists, padding, zero, negative, and oversized values are rejected.",
+            "in": "header",
+            "name": "If-Match",
+            "required": true,
+            "schema": {
+              "example": "\"v1\"",
+              "pattern": "^\"v[1-9][0-9]*\"$",
+              "type": "string"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/merge-patch+json": {
@@ -496,8 +574,9 @@
             "description": "Profile override updated",
             "headers": {
               "Cache-Control": {
-                "description": "Always `no-store` for profile responses.",
+                "description": "Always present with the fixed value `no-store` for profile responses.",
                 "schema": {
+                  "const": "no-store",
                   "example": "no-store",
                   "type": "string"
                 }
@@ -554,7 +633,17 @@
                 }
               }
             },
-            "description": "The profile precondition is invalid"
+            "description": "The profile precondition is invalid",
+            "headers": {
+              "Cache-Control": {
+                "description": "Always present with the fixed value `no-store` for profile responses.",
+                "schema": {
+                  "const": "no-store",
+                  "example": "no-store",
+                  "type": "string"
+                }
+              }
+            }
           },
           "401": {
             "content": {
@@ -600,7 +689,25 @@
                 }
               }
             },
-            "description": "Invalid access token"
+            "description": "Invalid access token",
+            "headers": {
+              "Cache-Control": {
+                "description": "Always present with the fixed value `no-store` for profile responses.",
+                "schema": {
+                  "const": "no-store",
+                  "example": "no-store",
+                  "type": "string"
+                }
+              },
+              "WWW-Authenticate": {
+                "description": "Always present with the fixed bearer challenge for invalid tokens.",
+                "schema": {
+                  "const": "Bearer realm=\"identity\", error=\"invalid_token\"",
+                  "example": "Bearer realm=\"identity\", error=\"invalid_token\"",
+                  "type": "string"
+                }
+              }
+            }
           },
           "403": {
             "content": {
@@ -646,7 +753,25 @@
                 }
               }
             },
-            "description": "Insufficient scope or unavailable local account"
+            "description": "Insufficient scope or unavailable local account",
+            "headers": {
+              "Cache-Control": {
+                "description": "Always present with the fixed value `no-store` for profile responses.",
+                "schema": {
+                  "const": "no-store",
+                  "example": "no-store",
+                  "type": "string"
+                }
+              },
+              "WWW-Authenticate": {
+                "description": "Present with the fixed insufficient-scope bearer challenge for scope failures; absent for `account_unavailable`.",
+                "schema": {
+                  "const": "Bearer realm=\"identity\", error=\"insufficient_scope\"",
+                  "example": "Bearer realm=\"identity\", error=\"insufficient_scope\"",
+                  "type": "string"
+                }
+              }
+            }
           },
           "404": {
             "content": {
@@ -692,7 +817,17 @@
                 }
               }
             },
-            "description": "The identity has not been initialized"
+            "description": "The identity has not been initialized",
+            "headers": {
+              "Cache-Control": {
+                "description": "Always present with the fixed value `no-store` for profile responses.",
+                "schema": {
+                  "const": "no-store",
+                  "example": "no-store",
+                  "type": "string"
+                }
+              }
+            }
           },
           "412": {
             "content": {
@@ -738,7 +873,17 @@
                 }
               }
             },
-            "description": "The profile version has changed"
+            "description": "The profile version has changed",
+            "headers": {
+              "Cache-Control": {
+                "description": "Always present with the fixed value `no-store` for profile responses.",
+                "schema": {
+                  "const": "no-store",
+                  "example": "no-store",
+                  "type": "string"
+                }
+              }
+            }
           },
           "415": {
             "content": {
@@ -784,7 +929,17 @@
                 }
               }
             },
-            "description": "The media type is unsupported"
+            "description": "The media type is unsupported",
+            "headers": {
+              "Cache-Control": {
+                "description": "Always present with the fixed value `no-store` for profile responses.",
+                "schema": {
+                  "const": "no-store",
+                  "example": "no-store",
+                  "type": "string"
+                }
+              }
+            }
           },
           "422": {
             "content": {
@@ -830,7 +985,17 @@
                 }
               }
             },
-            "description": "The merge patch is invalid"
+            "description": "The merge patch is invalid",
+            "headers": {
+              "Cache-Control": {
+                "description": "Always present with the fixed value `no-store` for profile responses.",
+                "schema": {
+                  "const": "no-store",
+                  "example": "no-store",
+                  "type": "string"
+                }
+              }
+            }
           },
           "428": {
             "content": {
@@ -876,7 +1041,17 @@
                 }
               }
             },
-            "description": "A profile version precondition is required"
+            "description": "A profile version precondition is required",
+            "headers": {
+              "Cache-Control": {
+                "description": "Always present with the fixed value `no-store` for profile responses.",
+                "schema": {
+                  "const": "no-store",
+                  "example": "no-store",
+                  "type": "string"
+                }
+              }
+            }
           },
           "503": {
             "content": {
@@ -922,7 +1097,25 @@
                 }
               }
             },
-            "description": "Authentication or profile dependency unavailable"
+            "description": "Authentication or profile dependency unavailable",
+            "headers": {
+              "Cache-Control": {
+                "description": "Always present with the fixed value `no-store` for profile responses.",
+                "schema": {
+                  "const": "no-store",
+                  "example": "no-store",
+                  "type": "string"
+                }
+              },
+              "Retry-After": {
+                "description": "Optional. Present only when a validated UserInfo rate-limit response supplies a delay from 0 through 300 seconds; absent for every other 503 response.",
+                "schema": {
+                  "example": "30",
+                  "pattern": "^(?:0|[1-9][0-9]?|[12][0-9]{2}|300)$",
+                  "type": "string"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -949,8 +1142,9 @@
             "description": "Existing identity synchronized",
             "headers": {
               "Cache-Control": {
-                "description": "Always `no-store` for profile responses.",
+                "description": "Always present with the fixed value `no-store` for profile responses.",
                 "schema": {
+                  "const": "no-store",
                   "example": "no-store",
                   "type": "string"
                 }
@@ -974,8 +1168,9 @@
             "description": "Identity initialized",
             "headers": {
               "Cache-Control": {
-                "description": "Always `no-store` for profile responses.",
+                "description": "Always present with the fixed value `no-store` for profile responses.",
                 "schema": {
+                  "const": "no-store",
                   "example": "no-store",
                   "type": "string"
                 }
@@ -1032,7 +1227,17 @@
                 }
               }
             },
-            "description": "A request body is not allowed"
+            "description": "A request body is not allowed",
+            "headers": {
+              "Cache-Control": {
+                "description": "Always present with the fixed value `no-store` for profile responses.",
+                "schema": {
+                  "const": "no-store",
+                  "example": "no-store",
+                  "type": "string"
+                }
+              }
+            }
           },
           "401": {
             "content": {
@@ -1078,7 +1283,25 @@
                 }
               }
             },
-            "description": "Invalid access token"
+            "description": "Invalid access token",
+            "headers": {
+              "Cache-Control": {
+                "description": "Always present with the fixed value `no-store` for profile responses.",
+                "schema": {
+                  "const": "no-store",
+                  "example": "no-store",
+                  "type": "string"
+                }
+              },
+              "WWW-Authenticate": {
+                "description": "Always present with the fixed bearer challenge for invalid tokens.",
+                "schema": {
+                  "const": "Bearer realm=\"identity\", error=\"invalid_token\"",
+                  "example": "Bearer realm=\"identity\", error=\"invalid_token\"",
+                  "type": "string"
+                }
+              }
+            }
           },
           "403": {
             "content": {
@@ -1124,7 +1347,25 @@
                 }
               }
             },
-            "description": "Insufficient scope or unavailable local account"
+            "description": "Insufficient scope or unavailable local account",
+            "headers": {
+              "Cache-Control": {
+                "description": "Always present with the fixed value `no-store` for profile responses.",
+                "schema": {
+                  "const": "no-store",
+                  "example": "no-store",
+                  "type": "string"
+                }
+              },
+              "WWW-Authenticate": {
+                "description": "Present with the fixed insufficient-scope bearer challenge for scope failures; absent for `account_unavailable`.",
+                "schema": {
+                  "const": "Bearer realm=\"identity\", error=\"insufficient_scope\"",
+                  "example": "Bearer realm=\"identity\", error=\"insufficient_scope\"",
+                  "type": "string"
+                }
+              }
+            }
           },
           "503": {
             "content": {
@@ -1170,7 +1411,25 @@
                 }
               }
             },
-            "description": "Authentication or profile dependency unavailable"
+            "description": "Authentication or profile dependency unavailable",
+            "headers": {
+              "Cache-Control": {
+                "description": "Always present with the fixed value `no-store` for profile responses.",
+                "schema": {
+                  "const": "no-store",
+                  "example": "no-store",
+                  "type": "string"
+                }
+              },
+              "Retry-After": {
+                "description": "Optional. Present only when a validated UserInfo rate-limit response supplies a delay from 0 through 300 seconds; absent for every other 503 response.",
+                "schema": {
+                  "example": "30",
+                  "pattern": "^(?:0|[1-9][0-9]?|[12][0-9]{2}|300)$",
+                  "type": "string"
+                }
+              }
+            }
           }
         },
         "security": [
