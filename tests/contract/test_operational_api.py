@@ -9,6 +9,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+import httpx2
 import pytest
 from fastapi import HTTPException, Request
 from prometheus_client import CONTENT_TYPE_LATEST
@@ -17,6 +18,7 @@ from starlette.types import Message, Scope
 from identity_service.api.problems import PROBLEM_MEDIA_TYPE, status_problem
 from identity_service.app import create_app
 from identity_service.config import AppEnvironment, Settings
+from tests.fixtures.fake_cognito import FakeCognito
 from tests.http_client import ASGIClient
 
 
@@ -59,6 +61,7 @@ def test_readiness_has_safe_success_and_failure_contract(
     assert isinstance(monkeypatch, MonkeyPatch)
     app = create_app(settings_factory())
     monkeypatch.setattr("identity_service.api.routes.check_database_readiness", lambda *_: True)
+    monkeypatch.setattr("identity_service.security.jwks.JwksCache.ready", lambda _: True)
     with ASGIClient(app) as client:
         ready = client.get("/health/ready")
     assert ready.status_code == 200
@@ -101,8 +104,10 @@ def test_every_public_problem_body_uses_only_the_code_field(
     assert "error_code" not in body
 
 
-def test_blocked_readiness_does_not_block_liveness_on_same_asgi_event_loop(
-    settings_factory: Callable[..., Settings], monkeypatch: pytest.MonkeyPatch
+def test_blocked_jwks_fetch_does_not_block_liveness_on_same_asgi_event_loop(
+    settings_factory: Callable[..., Settings],
+    monkeypatch: pytest.MonkeyPatch,
+    fake_cognito: FakeCognito,
 ) -> None:
     blocked = threading.Event()
     release = threading.Event()
@@ -111,14 +116,14 @@ def test_blocked_readiness_does_not_block_liveness_on_same_asgi_event_loop(
     event_loop: asyncio.AbstractEventLoop | None = None
     blocked_on_loop: asyncio.Event | None = None
 
-    def blocking_readiness(*_args: object) -> bool:
+    def blocking_jwks_fetch(request: httpx2.Request) -> httpx2.Response:
         blocked.set()
         assert event_loop is not None
         assert blocked_on_loop is not None
         event_loop.call_soon_threadsafe(blocked_on_loop.set)
         if not release.wait(timeout=2):
             raise RuntimeError("readiness test synchronization timed out")
-        return False
+        return fake_cognito.handle(request)
 
     def release_after_observation() -> None:
         if not blocked.wait(timeout=2):
@@ -127,8 +132,12 @@ def test_blocked_readiness_does_not_block_liveness_on_same_asgi_event_loop(
             liveness_completed_before_release.append(live_completed.wait(timeout=0.5))
         release.set()
 
-    monkeypatch.setattr("identity_service.api.routes.check_database_readiness", blocking_readiness)
-    app = create_app(settings_factory())
+    fake_cognito.jwks_status = 500
+    monkeypatch.setattr("identity_service.api.routes.check_database_readiness", lambda *_: True)
+    app = create_app(
+        settings_factory(**fake_cognito.settings_overrides()),
+        upstream_transport=httpx2.MockTransport(blocking_jwks_fetch),
+    )
     observer = threading.Thread(target=release_after_observation)
     observer.start()
 
@@ -259,6 +268,7 @@ def test_local_documentation_is_usable_without_weakening_api_csp(
     settings_factory: Callable[..., Settings], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr("identity_service.api.routes.check_database_readiness", lambda *_: False)
+    monkeypatch.setattr("identity_service.security.jwks.JwksCache.ready", lambda _: False)
     app = create_app(settings_factory(enable_interactive_docs=True))
     with ASGIClient(app) as client:
         docs = client.get("/docs")
@@ -540,6 +550,7 @@ def test_openapi_response_schemas_match_live_responses(
     app = create_app(settings_factory())
     document = app.openapi()
     monkeypatch.setattr("identity_service.api.routes.check_database_readiness", lambda *_: True)
+    monkeypatch.setattr("identity_service.security.jwks.JwksCache.ready", lambda _: True)
     with ASGIClient(app) as client:
         live = client.get("/health/live")
         ready = client.get("/health/ready")

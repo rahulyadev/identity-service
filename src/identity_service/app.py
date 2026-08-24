@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 
+import httpx2
 from fastapi import APIRouter, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -17,9 +18,20 @@ from identity_service.api.routes import router
 from identity_service.config import Settings
 from identity_service.db import build_engine, build_session_factory
 from identity_service.observability import Metrics, configure_logging
+from identity_service.security import (
+    AccessTokenVerifier,
+    CognitoUserInfoClient,
+    JwksCache,
+    UpstreamHttpClient,
+)
 
 
-def create_app(settings: Settings | None = None) -> FastAPI:
+def create_app(
+    settings: Settings | None = None,
+    *,
+    upstream_transport: httpx2.BaseTransport | None = None,
+    jwks_monotonic_clock: Callable[[], float] | None = None,
+) -> FastAPI:
     resolved = settings or Settings()
     configure_logging(resolved)
     metrics = Metrics()
@@ -27,12 +39,27 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         engine = build_engine(resolved)
+        upstream_client = UpstreamHttpClient(resolved, transport=upstream_transport)
+        jwks_options = (
+            {"monotonic": jwks_monotonic_clock} if jwks_monotonic_clock is not None else {}
+        )
+        jwks_cache = JwksCache(resolved, upstream_client, metrics=metrics, **jwks_options)
         app.state.engine = engine
         app.state.session_factory = build_session_factory(engine)
+        app.state.upstream_http_client = upstream_client
+        app.state.jwks_cache = jwks_cache
+        app.state.access_token_verifier = AccessTokenVerifier(resolved, jwks_cache, metrics=metrics)
+        app.state.userinfo_client = CognitoUserInfoClient(
+            resolved, upstream_client, metrics=metrics
+        )
         try:
             yield
         finally:
-            engine.dispose(close=True)
+            jwks_cache.close()
+            try:
+                upstream_client.close()
+            finally:
+                engine.dispose(close=True)
 
     docs_url = "/docs" if resolved.enable_interactive_docs else None
     redoc_url = "/redoc" if resolved.enable_interactive_docs else None

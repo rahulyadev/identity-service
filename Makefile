@@ -120,7 +120,7 @@ docker-build:
 	docker build --target runtime -t identity-service:local .
 
 docker-smoke:
-	$(PYTHON) scripts/container_smoke.py
+	$(PYTHON) -m scripts.container_smoke
 
 check-local-prerequisites:
 	@docker info >/dev/null 2>&1 || { echo "complete validation requires access to a running Docker daemon" >&2; exit 2; }

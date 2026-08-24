@@ -118,7 +118,7 @@
                 }
               }
             },
-            "description": "PostgreSQL or migration revision is not ready"
+            "description": "A required dependency or revision is not ready"
           }
         },
         "summary": "Ready",

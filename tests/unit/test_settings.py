@@ -22,6 +22,25 @@ ENVIRONMENT_KEYS = (
     "LOG_LEVEL",
     "LOG_FORMAT",
     "METRICS_ENABLED",
+    "COGNITO_ISSUER",
+    "COGNITO_JWKS_URL",
+    "COGNITO_USERINFO_URL",
+    "COGNITO_ALLOWED_CLIENT_IDS",
+    "OAUTH_RESOURCE",
+    "OAUTH_PROFILE_READ_SCOPE",
+    "OAUTH_PROFILE_WRITE_SCOPE",
+    "JWT_CLOCK_SKEW_SECONDS",
+    "JWT_MAX_TOKEN_BYTES",
+    "JWKS_CACHE_MAX_AGE_SECONDS",
+    "JWKS_STALE_IF_ERROR_SECONDS",
+    "JWKS_REFRESH_MIN_INTERVAL_SECONDS",
+    "JWKS_NEGATIVE_KID_CACHE_SECONDS",
+    "JWKS_MAX_KEYS",
+    "UPSTREAM_CONNECT_TIMEOUT_SECONDS",
+    "UPSTREAM_READ_TIMEOUT_SECONDS",
+    "UPSTREAM_WRITE_TIMEOUT_SECONDS",
+    "UPSTREAM_POOL_TIMEOUT_SECONDS",
+    "UPSTREAM_MAX_RESPONSE_BYTES",
     "DATABASE_URL",
     "DB_POOL_SIZE",
     "DB_MAX_OVERFLOW",
@@ -406,6 +425,13 @@ def test_deployed_process_startup_rejects_non_tcp_database_urls_without_disclosu
             "ENABLE_INTERACTIVE_DOCS": "false",
             "LOG_LEVEL": "INFO",
             "LOG_FORMAT": "json",
+            "COGNITO_ISSUER": ("https://cognito-idp.us-test-1.amazonaws.com/us-test-1_TestPool"),
+            "COGNITO_JWKS_URL": (
+                "https://cognito-idp.us-test-1.amazonaws.com/"
+                "us-test-1_TestPool/.well-known/jwks.json"
+            ),
+            "COGNITO_USERINFO_URL": "https://auth.example.invalid/oauth2/userInfo",
+            "COGNITO_ALLOWED_CLIENT_IDS": '["synthetic-test-client"]',
         }
     )
     if category == "unix_socket_override":

@@ -1,11 +1,13 @@
 # identity-service
 
-Identity service to store user data. The service currently provides a PostgreSQL identity model, a
-concurrency-safe internal identity/profile service, operational HTTP endpoints, migrations,
+Identity service to store user data. The service provides a PostgreSQL identity model, a
+concurrency-safe internal identity/profile service, strict Cognito access-token verification, a
+bounded JWKS cache, a subject-bound UserInfo adapter, operational HTTP endpoints, migrations,
 observability, local containers, and automated checks.
 
-The service does not provide Cognito or Google token validation, browser login, callback, session,
-cookie, logout, or a `/v1/me` endpoint. The only HTTP surface is operational.
+The security core is internal and reusable; no bearer-authenticated application route consumes it
+yet. The service does not provide Google token validation, browser login, callback, session,
+cookie, logout, or a `/v1/me` endpoint. The only HTTP surface remains operational.
 
 ## Current contract
 
@@ -50,8 +52,11 @@ make db-up
 make migrate
 make app-up
 curl --fail http://localhost:8080/health/live
-curl --fail http://localhost:8080/health/ready
 ```
+
+Readiness also needs a usable JWKS snapshot. Supply the documented local/test Cognito fixture URLs
+when exercising the app manually; `make docker-smoke` creates and removes an ephemeral fixture
+automatically and never calls a real identity provider.
 
 Migrations run explicitly as `identity_service_migrator`; the application runs as
 `identity_service_app`. Application startup never runs DDL. Stop the stack and remove only its
@@ -111,7 +116,7 @@ image-level SBOM.
 | Method | Path | Behavior |
 | --- | --- | --- |
 | `GET` | `/health/live` | Process/application liveness only; never queries PostgreSQL. |
-| `GET` | `/health/ready` | `200` only after `SELECT 1` succeeds and the one stored Alembic revision equals the packaged head; otherwise safe `503`. |
+| `GET` | `/health/ready` | `200` only when PostgreSQL is reachable, the one stored Alembic revision equals the packaged head, and the bounded Cognito JWKS cache is usable; otherwise safe `503`. |
 | `GET` | `/metrics` | Prometheus metrics when `METRICS_ENABLED=true`; intended for infrastructure-restricted access. |
 | `GET` | `/openapi.json` | Generated OpenAPI document. |
 
@@ -144,6 +149,18 @@ use JSON-array encoding, for example `ALLOWED_HOSTS='["identity.test","localhost
 | `LOG_LEVEL` | `INFO`; deployed development/staging/production reject `DEBUG` |
 | `LOG_FORMAT` | `console`; deployed development/staging/production require `json` |
 | `METRICS_ENABLED` | `true` |
+| `COGNITO_ISSUER` | exact User Pool issuer; deployed environments require one regional HTTPS Cognito issuer and pool path |
+| `COGNITO_JWKS_URL` | exactly issuer plus `/.well-known/jwks.json`; redirects are disabled |
+| `COGNITO_USERINFO_URL` | credential-free URL with exact `/oauth2/userInfo` path; HTTPS when deployed |
+| `COGNITO_ALLOWED_CLIENT_IDS` | JSON array of 1–16 unique bounded client IDs |
+| `OAUTH_RESOURCE` | exact access-token audience/resource (`identity-service://api` for local tests) |
+| `OAUTH_PROFILE_READ_SCOPE` / `OAUTH_PROFILE_WRITE_SCOPE` | distinct exact scopes namespaced beneath the resource |
+| `JWT_CLOCK_SKEW_SECONDS` / `JWT_MAX_TOKEN_BYTES` | `60` / `16384`; both strictly bounded |
+| `JWKS_CACHE_MAX_AGE_SECONDS` / `JWKS_STALE_IF_ERROR_SECONDS` | `300` / `1800`; stale fallback has a hard bound |
+| `JWKS_REFRESH_MIN_INTERVAL_SECONDS` / `JWKS_NEGATIVE_KID_CACHE_SECONDS` | `10` / `10`; limits refresh storms |
+| `JWKS_MAX_KEYS` | `16` |
+| `UPSTREAM_*_TIMEOUT_SECONDS` | connect `2`, read `3`, write `3`, pool `2`; independent bounds |
+| `UPSTREAM_MAX_RESPONSE_BYTES` | `65536` |
 | `DATABASE_URL` | required `postgresql+psycopg` URL; deployed environments require one explicit authority TCP host and exactly one `sslmode=verify-full`; no source default |
 | `DB_POOL_SIZE` / `DB_MAX_OVERFLOW` | `5` / `10` |
 | `DB_POOL_TIMEOUT_SECONDS` | `5` |
@@ -160,6 +177,41 @@ rejected, as are Unix-domain sockets and multiple destinations. `sslmode=verify-
 not establish this contract when the connection can be redirected to a local socket. Local and
 test environments may deliberately use a Unix-domain socket. Invalid settings fail application
 construction without echoing the URL.
+
+Development, staging, and production require HTTPS provider URLs, reject credentials, query and
+fragment components, reject loopback endpoints, and require the JWKS URL to derive exactly from a
+regional Cognito User Pool issuer. The only HTTP/loopback relaxation is local/test fixture use. The
+shared upstream client ignores proxy environment variables, follows no redirects, rejects provider
+cookie storage and transmission, uses bounded timeouts, and checks the remaining response allowance
+before retaining each streamed chunk. It sends bearer authorization only to the configured
+UserInfo destination.
+
+The verifier fixes the algorithm to RS256, requires at least 2048-bit RSA verification keys, and
+validates the signature, exact issuer, access-token `token_use`, allowed `client_id`, resource
+audience, exact required scopes, bounded time claims, and opaque subject. Bounded structural
+pre-validation rejects unsafe JWT JSON depth without using unverified claims for authorization;
+decoder type, numeric, and recursion failures become redacted typed token outcomes. The first
+lookup after the effective freshness deadline triggers one
+single-flight refresh even when an upstream `max-age` is shorter than the retry interval. The
+refresh interval suppresses retries only after an actual failed refresh and bounds hostile
+unknown-key storms; degraded stale use never begins merely because a successful fetch was recent.
+A previously loaded snapshot may be used after failure only through the configured stale-if-error
+hard limit. Exact negative-key results are bound to the fresh snapshot that proved absence, and one
+successful refresh that omits a requested key is authoritative without a second provider request.
+Public JWKS keys reject contradictory `key_ops`, private RSA fields, and weak RSA material while
+standards-valid additional JWK Set members are ignored. JWKS and UserInfo JSON reject non-finite
+numbers, numeric conversion-limit input, malformed encoding, and excessive nesting. Oversized
+`Cache-Control` values use a conservative one-second freshness policy; invalid directives are
+ignored and the lowest valid bounded `max-age` wins. UserInfo requires `openid`, validates a
+matching case-sensitive `sub`, accepts only a short decimal `Retry-After` of at most 300 seconds,
+rejects Unicode control characters, and parses only a bounded profile claim set before existing
+transactional identity synchronization. Verified-token string representations are always redacted.
+
+Offline signature verification cannot provide instantaneous revocation awareness: a revoked or
+globally signed-out token can remain locally verifiable until its expiration. Cognito UserInfo can
+reject expired, revoked, disabled, deleted, or globally signed-out users during synchronization,
+providing a stronger current-state check at that point. Raw tokens, claims, subjects, email,
+provider responses, URLs, client IDs, and key IDs are excluded from logs and metric labels.
 
 ## Ownership boundary
 

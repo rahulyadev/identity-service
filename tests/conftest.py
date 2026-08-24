@@ -6,6 +6,12 @@ from typing import Any
 import pytest
 
 from identity_service.config import AppEnvironment, Settings
+from tests.fixtures.fake_cognito import FakeCognito
+
+
+@pytest.fixture
+def fake_cognito() -> FakeCognito:
+    return FakeCognito()
 
 
 @pytest.fixture
@@ -17,6 +23,13 @@ def settings_factory() -> Callable[..., Settings]:
             "identity_origin": "http://localhost:8080",
             "allowed_hosts": ["testserver", "localhost", "127.0.0.1"],
             "trusted_proxy_cidrs": [],
+            "cognito_issuer": ("https://cognito-idp.us-test-1.amazonaws.com/us-test-1_TestPool"),
+            "cognito_jwks_url": (
+                "https://cognito-idp.us-test-1.amazonaws.com/"
+                "us-test-1_TestPool/.well-known/jwks.json"
+            ),
+            "cognito_userinfo_url": "https://auth.example.invalid/oauth2/userInfo",
+            "cognito_allowed_client_ids": ["synthetic-test-client"],
             "database_url": "postgresql+psycopg://app:local@127.0.0.1:1/identity_test",  # pragma: allowlist secret (synthetic test credential)  # noqa: E501
             "enable_interactive_docs": False,
             "metrics_enabled": True,

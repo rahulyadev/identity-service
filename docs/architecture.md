@@ -11,6 +11,8 @@ psycopg 3 persistence layer. The package uses a compact `src/identity_service` l
 - `api` exposes operational routes and request-boundary middleware.
 - `observability` centralizes bounded metrics and the shared redacted application/Uvicorn logging
   pipeline.
+- `security` owns the fixed-RS256 access-token verifier, single-flight bounded JWKS cache, shared
+  upstream HTTP boundary, immutable verified-token contract, and subject-bound UserInfo adapter.
 
 No database connection is opened at module import. Application lifespan constructs a lazy engine
 and disposes it during shutdown. Each service operation owns one session and one transaction;
@@ -23,17 +25,33 @@ synchronous SQLAlchemy must retain an equivalent thread-pool boundary.
 
 ## Identity flow
 
-An already-validated future authentication adapter will supply strict `ProviderIdentityInput` and
-`ProviderProfileInput` values to `bootstrap_identity`. The service does not currently supply that
-adapter or expose identity/profile operations through HTTP.
+The internal security core validates a Cognito access token and binds a bounded UserInfo profile to
+the token's exact subject. That result can supply strict `ProviderIdentityInput` and
+`ProviderProfileInput` values to `bootstrap_identity`. The service does not expose this flow or any
+identity/profile operation through HTTP.
 
 Bootstrap derives a signed 64-bit PostgreSQL advisory-lock key from the first eight bytes of
 `SHA-256(issuer UTF-8 + NUL + subject UTF-8)`. It takes a transaction-scoped advisory lock, re-queries
 the exact pair, and creates or synchronizes the three rows atomically. The unique `(issuer, subject)`
 constraint remains the final correctness backstop.
 
-The application has no Redis, upstream HTTP call, background worker, event bus, browser state,
-roles/permissions model, or generic administration surface.
+The single process owns one synchronous, no-proxy/no-redirect upstream HTTP client. Application
+startup remains network-independent; readiness may perform a bounded JWKS fetch on a worker thread.
+The application has no Redis, background worker, event bus, browser state, roles/permissions model,
+or generic administration surface.
+
+## Cognito trust boundary
+
+Deployed configuration identifies one regional Cognito User Pool issuer, its exactly derived JWKS
+URL, one exact UserInfo path, allowed clients, one resource audience, and exact custom scopes. The
+signature algorithm is fixed in code to RS256. Key rotation uses an atomically replaced immutable
+JWKS snapshot with single-flight refresh, bounded negative caching, and a finite stale-if-error
+window. Malformed refreshes never replace usable key material.
+
+UserInfo is invoked only after local token verification and `openid` scope enforcement. Its exact,
+case-sensitive `sub` must match the verified token. No token, JWK, raw claim document, or UserInfo
+response is persisted. A generated-key HTTP fixture exists only in test code and the packed smoke
+harness; it is absent from the runtime image and forbidden by deployed URL validation.
 
 ## Infrastructure boundary
 

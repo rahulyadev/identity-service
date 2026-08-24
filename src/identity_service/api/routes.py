@@ -41,7 +41,7 @@ async def live() -> LiveResponse:
     operation_id="health_ready",
     responses={
         503: {
-            "description": "PostgreSQL or migration revision is not ready",
+            "description": "A required dependency or revision is not ready",
             "content": {
                 PROBLEM_MEDIA_TYPE: {
                     "schema": ProblemResponse.model_json_schema(),
@@ -52,7 +52,11 @@ async def live() -> LiveResponse:
     tags=["operations"],
 )
 def ready(request: Request) -> ReadyResponse | Response:
-    if not check_database_readiness(request.app.state.engine, request.app.state.metrics):
+    database_ready = check_database_readiness(request.app.state.engine, request.app.state.metrics)
+    jwks_ready = request.app.state.jwks_cache.ready()
+    ready_now = database_ready and jwks_ready
+    request.app.state.metrics.set_readiness(ready_now)
+    if not ready_now:
         return status_problem(503, get_request_id(request.scope))
     return ReadyResponse(status="ready")
 

@@ -53,6 +53,25 @@ services:
       LOG_LEVEL: INFO
       LOG_FORMAT: console
       METRICS_ENABLED: "true"
+      COGNITO_ISSUER: ${COGNITO_ISSUER:-http://host.docker.internal:9000/test-pool}
+      COGNITO_JWKS_URL: ${COGNITO_JWKS_URL:-http://host.docker.internal:9000/test-pool/.well-known/jwks.json}
+      COGNITO_USERINFO_URL: ${COGNITO_USERINFO_URL:-http://host.docker.internal:9000/oauth2/userInfo}
+      COGNITO_ALLOWED_CLIENT_IDS: '${COGNITO_ALLOWED_CLIENT_IDS:-["test-client"]}'
+      OAUTH_RESOURCE: ${OAUTH_RESOURCE:-identity-service://api}
+      OAUTH_PROFILE_READ_SCOPE: ${OAUTH_PROFILE_READ_SCOPE:-identity-service://api/profile.read}
+      OAUTH_PROFILE_WRITE_SCOPE: ${OAUTH_PROFILE_WRITE_SCOPE:-identity-service://api/profile.write}
+      JWT_CLOCK_SKEW_SECONDS: "60"
+      JWT_MAX_TOKEN_BYTES: "16384"
+      JWKS_CACHE_MAX_AGE_SECONDS: ${JWKS_CACHE_MAX_AGE_SECONDS:-300}
+      JWKS_STALE_IF_ERROR_SECONDS: ${JWKS_STALE_IF_ERROR_SECONDS:-1800}
+      JWKS_REFRESH_MIN_INTERVAL_SECONDS: ${JWKS_REFRESH_MIN_INTERVAL_SECONDS:-10}
+      JWKS_NEGATIVE_KID_CACHE_SECONDS: "10"
+      JWKS_MAX_KEYS: "16"
+      UPSTREAM_CONNECT_TIMEOUT_SECONDS: "2"
+      UPSTREAM_READ_TIMEOUT_SECONDS: "3"
+      UPSTREAM_WRITE_TIMEOUT_SECONDS: "3"
+      UPSTREAM_POOL_TIMEOUT_SECONDS: "2"
+      UPSTREAM_MAX_RESPONSE_BYTES: "65536"
       DATABASE_URL: postgresql+psycopg://identity_service_app:localapp@db:5432/identity_service # pragma: allowlist secret (fixed disposable local credential)
       DB_POOL_SIZE: "5"
       DB_MAX_OVERFLOW: "10"
@@ -72,6 +91,8 @@ services:
       - /tmp:size=16m,mode=1777
     cap_drop: ["ALL"]
     security_opt: ["no-new-privileges:true"]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     init: true
 
   test:

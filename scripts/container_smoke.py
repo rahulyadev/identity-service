@@ -16,6 +16,9 @@ import uuid
 from collections.abc import Mapping
 from pathlib import Path
 
+from tests.fixtures.fake_cognito import FakeCognito
+from tests.fixtures.fake_cognito_server import FakeCognitoServer
+
 ROOT = Path(__file__).resolve().parents[1]
 SMOKE_JSON_PATHS = {
     "/health/live",
@@ -82,6 +85,7 @@ def run(
     check: bool = True,
     include_stderr: bool = False,
     environment: Mapping[str, str] | None = None,
+    input_text: str | None = None,
 ) -> str:
     if not args or args[0] != "docker":
         raise ValueError("the container smoke runner permits only Docker commands")
@@ -96,6 +100,7 @@ def run(
         check=check,
         capture_output=capture,
         env=environment,
+        input=input_text,
         shell=False,
         text=True,
     )
@@ -222,6 +227,7 @@ def verify_raw_http_framing() -> list[tuple[str, str, int]]:
 
 
 def _deployed_environment() -> dict[str, str]:
+    issuer = "https://cognito-idp.us-east-1.amazonaws.com/us-east-1_TestPool"
     return {
         "APP_ENV": "development",
         "IDENTITY_ORIGIN": "https://identity.test",
@@ -232,6 +238,10 @@ def _deployed_environment() -> dict[str, str]:
         "DATABASE_URL": (
             "postgresql+psycopg://database.invalid/identity_service?sslmode=verify-full"
         ),
+        "COGNITO_ISSUER": issuer,
+        "COGNITO_JWKS_URL": issuer + "/.well-known/jwks.json",
+        "COGNITO_USERINFO_URL": ("https://cognito-idp.us-east-1.amazonaws.com/oauth2/userInfo"),
+        "COGNITO_ALLOWED_CLIENT_IDS": '["packed-smoke-client"]',
     }
 
 
@@ -472,13 +482,191 @@ def verify_deployed_json_logging(image_id: str) -> tuple[int, float]:
             run("docker", "rm", "--force", container_name, capture=True, check=False)
 
 
+def fixture_environment(port: int) -> dict[str, str]:
+    issuer = f"http://host.docker.internal:{port}/test-pool"
+    return {
+        "COGNITO_ISSUER": issuer,
+        "COGNITO_JWKS_URL": issuer + "/.well-known/jwks.json",
+        "COGNITO_USERINFO_URL": f"http://host.docker.internal:{port}/oauth2/userInfo",
+        "COGNITO_ALLOWED_CLIENT_IDS": '["fixture-client"]',
+        "JWKS_CACHE_MAX_AGE_SECONDS": "1",
+        "JWKS_STALE_IF_ERROR_SECONDS": "3",
+        "JWKS_REFRESH_MIN_INTERVAL_SECONDS": "1",
+    }
+
+
+def request_metrics() -> tuple[int, str]:
+    connection = http.client.HTTPConnection("127.0.0.1", 8080, timeout=2)
+    try:
+        connection.request("GET", "/metrics", headers={"Host": CANONICAL_HOST})
+        response = connection.getresponse()
+        return response.status, response.read().decode("utf-8")
+    finally:
+        connection.close()
+
+
+def wait_for_jwks_cache_state(
+    fake_cognito: FakeCognito,
+    expected_state: str,
+    *,
+    expected_ready: bool,
+    minimum_fetches: int = 0,
+) -> None:
+    deadline = time.monotonic() + 12
+    while time.monotonic() < deadline:
+        try:
+            ready_status, _, _ = request_json("/health/ready")
+            metrics_status, metrics_text = request_metrics()
+            state_line = f'identity_service_jwks_cache_state{{state="{expected_state}"}} 1.0'
+            if (
+                metrics_status == 200
+                and state_line in metrics_text
+                and (ready_status == 200) is expected_ready
+                and fake_cognito.jwks_fetches >= minimum_fetches
+            ):
+                return
+        except OSError, json.JSONDecodeError:
+            pass
+        time.sleep(0.2)
+    raise RuntimeError(f"JWKS cache did not reach the expected {expected_state} state")
+
+
+def verify_packed_access_token(raw_token: str, expected_outcome: str) -> None:
+    probe = (
+        "import sys\n"
+        "from identity_service.config import Settings\n"
+        "from identity_service.observability import Metrics\n"
+        "from identity_service.security import AccessTokenVerifier,JwksCache,UpstreamHttpClient\n"
+        "from identity_service.security.errors import SecurityCoreError,"
+        "TokenVerificationUnavailableError\n"
+        "settings=Settings()\n"
+        "client=UpstreamHttpClient(settings)\n"
+        "cache=JwksCache(settings,client,metrics=Metrics())\n"
+        "try:\n"
+        "    try:\n"
+        "        AccessTokenVerifier(settings,cache).verify_access_token(sys.stdin.read())\n"
+        "    except TokenVerificationUnavailableError:\n"
+        "        outcome='dependency_unavailable'\n"
+        "    except SecurityCoreError:\n"
+        "        outcome='rejected'\n"
+        "    else:\n"
+        "        outcome='verified'\n"
+        "finally:\n"
+        "    cache.close()\n"
+        "    client.close()\n"
+        "print(outcome)"
+    )
+    outcome = run(
+        "docker",
+        "compose",
+        "exec",
+        "-T",
+        "app",
+        "python",
+        "-c",
+        probe,
+        capture=True,
+        input_text=raw_token,
+    )
+    if outcome != expected_outcome:
+        raise RuntimeError("packed access-token verification returned an unsafe outcome")
+
+
+def verify_packed_jwks_outage_and_recovery(fake_cognito: FakeCognito) -> None:
+    initial_failure_fetches = fake_cognito.jwks_fetches
+    wait_for_jwks_cache_state(
+        fake_cognito,
+        "unavailable",
+        expected_ready=False,
+        minimum_fetches=initial_failure_fetches + 1,
+    )
+    verify_packed_access_token(fake_cognito.token(), "dependency_unavailable")
+
+    fake_cognito.jwks_status = 200
+    recovery_fetches = fake_cognito.jwks_fetches
+    wait_for_jwks_cache_state(
+        fake_cognito,
+        "fresh",
+        expected_ready=True,
+        minimum_fetches=recovery_fetches + 1,
+    )
+    verify_packed_access_token(fake_cognito.token(), "verified")
+
+    fake_cognito.rotate("packed-rotated-key", retain_old=False)
+    rotated_token = fake_cognito.token()
+    fake_cognito.jwks_status = 500
+    verify_packed_access_token(rotated_token, "dependency_unavailable")
+    fake_cognito.jwks_status = 200
+    verify_packed_access_token(rotated_token, "verified")
+    rotation_fetches = fake_cognito.jwks_fetches
+    wait_for_jwks_cache_state(
+        fake_cognito,
+        "fresh",
+        expected_ready=True,
+        minimum_fetches=rotation_fetches + 1,
+    )
+
+    fake_cognito.jwks_mode = "malformed_json"
+    malformed_fetches = fake_cognito.jwks_fetches
+    wait_for_jwks_cache_state(
+        fake_cognito,
+        "degraded",
+        expected_ready=True,
+        minimum_fetches=malformed_fetches + 1,
+    )
+    fake_cognito.jwks_mode = "valid"
+    repaired_fetches = fake_cognito.jwks_fetches
+    wait_for_jwks_cache_state(
+        fake_cognito,
+        "fresh",
+        expected_ready=True,
+        minimum_fetches=repaired_fetches + 1,
+    )
+
+    fake_cognito.jwks_status = 500
+    outage_fetches = fake_cognito.jwks_fetches
+    wait_for_jwks_cache_state(
+        fake_cognito,
+        "degraded",
+        expected_ready=True,
+        minimum_fetches=outage_fetches + 1,
+    )
+    wait_for_jwks_cache_state(fake_cognito, "unavailable", expected_ready=False)
+    fake_cognito.jwks_status = 200
+    final_recovery_fetches = fake_cognito.jwks_fetches
+    wait_for_jwks_cache_state(
+        fake_cognito,
+        "fresh",
+        expected_ready=True,
+        minimum_fetches=final_recovery_fetches + 1,
+    )
+    if fake_cognito.jwks_fetches < 8:
+        raise RuntimeError("packed JWKS outage/recovery did not perform bounded refreshes")
+    print(
+        "packed JWKS passed: initial_outage=unavailable initial_recovery=fresh "
+        "rotated_token_outage=dependency_unavailable rotation_refresh=verified "
+        "malformed_refresh=prior_snapshot_preserved outage=degraded "
+        f"hard_stale=unavailable final_recovery=fresh fetches={fake_cognito.jwks_fetches}"
+    )
+
+
 def main() -> int:
+    fake_cognito = FakeCognito()
+    fake_server = FakeCognitoServer(fake_cognito)
+    fake_server.start()
+    environment_overrides = fixture_environment(fake_server.port)
+    fake_cognito.issuer = environment_overrides["COGNITO_ISSUER"]
+    fake_cognito.jwks_url = environment_overrides["COGNITO_JWKS_URL"]
+    fake_cognito.userinfo_url = environment_overrides["COGNITO_USERINFO_URL"]
+    fake_cognito.jwks_status = 500
+    previous_environment = {key: os.environ.get(key) for key in environment_overrides}
+    os.environ.update(environment_overrides)
     try:
         run("docker", "compose", "up", "-d", "--wait", "db")
         run("docker", "compose", "run", "--rm", "migrate")
         run("docker", "compose", "up", "-d", "--wait", "app")
         wait_for_json("/health/live", "alive")
-        wait_for_json("/health/ready", "ready")
+        verify_packed_jwks_outage_and_recovery(fake_cognito)
 
         container_id = run("docker", "compose", "ps", "-q", "app", capture=True)
         if not container_id:
@@ -552,10 +740,12 @@ def main() -> int:
             raise RuntimeError("runtime filesystem write boundary was not enforced")
 
         tooling_probe = (
-            "import importlib.util,json,shutil; "
+            "import importlib.metadata,importlib.util,json,shutil; "
             "names=('pip','pip3','gcc','cc','make','git','aws','gcloud','terraform'); "
             "print(json.dumps({'paths':{name:shutil.which(name) for name in names},"
-            "'pip_module':importlib.util.find_spec('pip') is not None},sort_keys=True))"
+            "'pip_module':importlib.util.find_spec('pip') is not None,"
+            "'security_dependencies':{name:importlib.metadata.version(name) for name in "
+            "('PyJWT','cryptography','httpx2')}},sort_keys=True))"
         )
         tooling = json.loads(
             run(
@@ -574,13 +764,25 @@ def main() -> int:
             raise RuntimeError(
                 "build, package, VCS, cloud, or deployment tooling remains in runtime"
             )
+        if tooling["security_dependencies"] != {
+            "PyJWT": "2.13.0",
+            "cryptography": "50.0.0",
+            "httpx2": "2.12.0",
+        }:
+            raise RuntimeError("packed runtime security dependencies do not match the lock")
 
         artifact_probe = (
             "import json\n"
             "from pathlib import Path\n"
             "blocked={'.git','.env','.pytest_cache','.mypy_cache','.ruff_cache','.coverage',"
-            "'coverage.xml'}\n"
-            "found=sorted(str(path) for path in Path('/app').rglob('*') if path.name in blocked)\n"
+            "'coverage.xml','tests'}\n"
+            "found=[]\n"
+            "for path in Path('/app').rglob('*'):\n"
+            "    if path.name in blocked or 'fake_cognito' in path.name or path.suffix == '.key':\n"
+            "        found.append(str(path))\n"
+            "    elif path.is_file() and path.stat().st_size <= 1048576:\n"
+            "        if b'PRIVATE KEY' in path.read_bytes():\n"
+            "            found.append(str(path))\n"
             "print(json.dumps(found))"
         )
         artifacts = json.loads(
@@ -697,6 +899,22 @@ def main() -> int:
         shutdown_seconds = time.monotonic() - shutdown_started
         state = json.loads(run("docker", "inspect", container_id, capture=True))[0]["State"]
         shutdown_logs = run("docker", "logs", container_id, capture=True, include_stderr=True)
+        if (
+            re.search(
+                r"\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b",
+                shutdown_logs,
+            )
+            or re.search(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}", shutdown_logs)
+            or any(
+                value in shutdown_logs
+                for value in (
+                    fake_cognito.active_kid,
+                    "fixture-key-1",
+                    "opaque-Subject_1",
+                )
+            )
+        ):
+            raise RuntimeError("packed container logs exposed identity or key material")
         graceful_markers = (
             "Shutting down",
             "Waiting for application shutdown",
@@ -717,6 +935,7 @@ def main() -> int:
             "packed image passed: "
             f"image={image['Id']} uid_gid={identity} read_only=true tmpfs=/tmp "
             "cap_drop=ALL no_new_privileges=true app_processes=1 "
+            "runtime_security_dependencies=true fixture_excluded=true private_keys_absent=true "
             f"canonical_health_host=true loopback_host_rejected=true outage_recovery=true "
             f"startup_redaction=true raw_http_cases={len(raw_outcomes)} "
             f"deployed_json_logging=true json_shutdown_exit={json_shutdown_exit} "
@@ -727,6 +946,12 @@ def main() -> int:
         return 0
     finally:
         run("docker", "compose", "down", "--volumes", "--remove-orphans", check=False)
+        for key, previous_value in previous_environment.items():
+            if previous_value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = previous_value
+        fake_server.close()
 
 
 if __name__ == "__main__":

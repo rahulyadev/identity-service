@@ -45,7 +45,12 @@ COMMON_JSON_FIELDS = frozenset(
     {"timestamp", "level", "logger", "message", "service", "service_version", "environment"}
 )
 UVICORN_PROPAGATING_LOGGERS = ("uvicorn", "uvicorn.error", "uvicorn.asgi")
-CONTROLLED_PROPAGATING_LOGGERS = ("identity_service", *UVICORN_PROPAGATING_LOGGERS)
+CONTROLLED_PROPAGATING_LOGGERS = (
+    "identity_service",
+    "httpx2",
+    "httpcore2",
+    *UVICORN_PROPAGATING_LOGGERS,
+)
 UVICORN_LIFECYCLE_EVENTS = (
     ("Started server process", "server_started"),
     ("Waiting for application startup", "application_startup_wait"),
@@ -93,9 +98,8 @@ def redact_value(value: Any, *, key: str = "") -> Any:
 
 class RedactingFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
-        record.msg = redact_value(record.msg)
-        if record.args:
-            record.args = redact_value(record.args)
+        record.msg = redact_text(record.getMessage())
+        record.args = ()
         for key, value in tuple(record.__dict__.items()):
             if key not in STANDARD_LOG_RECORD_FIELDS:
                 record.__dict__[key] = redact_value(value, key=key)
@@ -192,3 +196,5 @@ def configure_logging(settings: Settings, *, stream: TextIO | None = None) -> No
     access_logger.propagate = False
 
     logging.getLogger("sqlalchemy.engine").setLevel(logging.WARNING)
+    logging.getLogger("httpx2").setLevel(logging.WARNING)
+    logging.getLogger("httpcore2").setLevel(logging.WARNING)

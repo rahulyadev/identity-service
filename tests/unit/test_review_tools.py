@@ -84,7 +84,16 @@ def test_runtime_sbom_rejects_credentials_and_local_paths(sensitive_value: str) 
 def test_actual_runtime_and_development_locks_have_expected_boundary() -> None:
     runtime = check_sbom.locked_components(check_sbom.ROOT / "requirements.lock")
     development = check_sbom.locked_components(check_sbom.ROOT / "requirements-dev.lock")
-    assert len(runtime) == 23
+    assert len(runtime) == 30
+    assert {
+        "httpx2",
+        "httpcore2",
+        "truststore",
+        "pyjwt",
+        "cryptography",
+        "cffi",
+        "pycparser",
+    } <= set(runtime)
     assert set(runtime) < set(development)
     assert "pytest" not in runtime
     assert "pytest" in development
