@@ -31,8 +31,24 @@ def test_browser_token_storage_and_deferred_cookie_authenticated_surfaces_are_ab
 def test_session_cookie_source_has_the_exact_host_only_security_boundary() -> None:
     app_source = (BFF_SOURCE / "app.py").read_text()
     assert '"__Host-session"' in app_source
+    assert '"__Host-oauth"' in (BFF_SOURCE / "callback.py").read_text()
     assert "secure=True" in app_source
     assert "httponly=True" in app_source
     assert 'samesite="lax"' in app_source
     assert 'path="/"' in app_source
     assert "domain=" not in app_source.casefold()
+
+
+def test_callback_binding_uses_raw_headers_one_time_transaction_and_constant_compare() -> None:
+    callback_source = (BFF_SOURCE / "callback.py").read_text()
+    app_source = (BFF_SOURCE / "app.py").read_text()
+    assert "Iterable[tuple[bytes, bytes]]" in callback_source
+    assert "MAX_COOKIE_HEADER_BYTES" in callback_source
+    assert "request.cookies" not in app_source
+    assert "request.headers.get" not in app_source
+    assert "store.consume(callback_query.state)" in app_source
+    assert "secrets.compare_digest" in app_source
+    assert app_source.index("store.consume(callback_query.state)") < app_source.index(
+        "secrets.compare_digest"
+    )
+    assert "delete_cookie" in app_source

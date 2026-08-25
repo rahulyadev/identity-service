@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import secrets
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from urllib.parse import urlencode
@@ -13,10 +14,12 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.responses import JSONResponse, RedirectResponse, Response
 
 from reference_bff.callback import (
+    OAUTH_BINDING_COOKIE_NAME,
     CallbackDenied,
-    CallbackSuccess,
     InvalidCallbackQueryError,
+    InvalidOAuthBrowserBindingError,
     parse_callback_query,
+    parse_oauth_browser_binding,
 )
 from reference_bff.config import Settings
 from reference_bff.exchange import AuthorizationCodeClient
@@ -35,6 +38,28 @@ from reference_bff.store import (
 )
 from reference_bff.tokens import CognitoTokenVerifier
 from reference_bff.transactions import ExpiredTransactionError, MalformedTransactionError
+
+
+def _set_oauth_binding_cookie(response: Response, transaction_id: str, *, max_age: int) -> None:
+    response.set_cookie(
+        OAUTH_BINDING_COOKIE_NAME,
+        transaction_id,
+        max_age=max_age,
+        path="/",
+        secure=True,
+        httponly=True,
+        samesite="lax",
+    )
+
+
+def _clear_oauth_binding_cookie(response: Response) -> None:
+    response.delete_cookie(
+        OAUTH_BINDING_COOKIE_NAME,
+        path="/",
+        secure=True,
+        httponly=True,
+        samesite="lax",
+    )
 
 
 def create_app(
@@ -128,7 +153,13 @@ def create_app(
             )
         )
         logging.getLogger("reference_bff.http").info("authorization_transaction_created")
-        return RedirectResponse(f"{resolved.authorization_endpoint}?{query}", status_code=307)
+        response = RedirectResponse(f"{resolved.authorization_endpoint}?{query}", status_code=307)
+        _set_oauth_binding_cookie(
+            response,
+            transaction.transaction_id,
+            max_age=resolved.oauth_transaction_ttl_seconds,
+        )
+        return response
 
     @app.get("/auth/callback", include_in_schema=False)
     async def callback(request: Request) -> Response:
@@ -150,18 +181,31 @@ def create_app(
             raise PublicProblemError(400, "invalid_oauth_transaction") from None
         if transaction is None:
             raise PublicProblemError(400, "invalid_oauth_transaction")
+        try:
+            browser_binding = parse_oauth_browser_binding(request.scope.get("headers", []))
+        except InvalidOAuthBrowserBindingError:
+            raise PublicProblemError(400, "invalid_oauth_transaction") from None
+        if not secrets.compare_digest(browser_binding.transaction_id, transaction.transaction_id):
+            raise PublicProblemError(400, "invalid_oauth_transaction")
         if isinstance(callback_query, CallbackDenied):
             logging.getLogger("reference_bff.http").info("authorization_denied")
-            raise PublicProblemError(400, "authorization_denied")
-        if not isinstance(callback_query, CallbackSuccess):
-            raise PublicProblemError(400, "invalid_callback")
+            denial_response = problem_response(
+                400, "authorization_denied", get_request_id(request.scope)
+            )
+            _clear_oauth_binding_cookie(denial_response)
+            return denial_response
         service: CallbackCompleter = request.app.state.callback_service
         try:
             session = await service.complete(callback_query.code, transaction)
         except CallbackFlowError as error:
-            raise PublicProblemError(error.status, error.code) from None
-        response = RedirectResponse(transaction.return_to, status_code=303)
-        response.set_cookie(
+            failure_response = problem_response(
+                error.status, error.code, get_request_id(request.scope)
+            )
+            _clear_oauth_binding_cookie(failure_response)
+            return failure_response
+        redirect_response = RedirectResponse(transaction.return_to, status_code=303)
+        _clear_oauth_binding_cookie(redirect_response)
+        redirect_response.set_cookie(
             "__Host-session",
             session.session_id,
             max_age=session.max_age,
@@ -171,7 +215,7 @@ def create_app(
             samesite="lax",
         )
         logging.getLogger("reference_bff.http").info("browser_session_created")
-        return response
+        return redirect_response
 
     @app.exception_handler(PublicProblemError)
     async def public_problem_handler(request: Request, error: PublicProblemError) -> Response:

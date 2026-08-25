@@ -15,7 +15,7 @@ def test_log_filter_redacts_oauth_and_credential_url_material() -> None:
         f"state=sensitive-state redis://{username}:{credential}@cache.invalid/0 "
         "client_secret=secret access_token=synthetic-access id_token=synthetic-id "
         "refresh_token=synthetic-refresh code=synthetic-code subject=synthetic-subject "
-        "session_id=synthetic-session"
+        "session_id=synthetic-session __Host-oauth=synthetic-binding"
     )
     record = logging.LogRecord(
         "reference_bff.test",
@@ -37,6 +37,7 @@ def test_log_filter_redacts_oauth_and_credential_url_material() -> None:
     assert "synthetic-code" not in rendered
     assert "synthetic-subject" not in rendered
     assert "synthetic-session" not in rendered
+    assert "synthetic-binding" not in rendered
     assert "[REDACTED]" in rendered
 
 

@@ -11,10 +11,13 @@ The public surface is deliberately small:
 - `GET /health/ready` proves both transaction/session Redis capabilities and a usable bounded JWKS
   snapshot. Its short-lived `SET NX EX` plus `GETDEL` probes leave no key after success.
 - `GET /auth/login` validates an optional local `return_to`, persists a one-time transaction, and
-  returns a resource-bound provider redirect using state, nonce, and PKCE S256.
+  returns a resource-bound provider redirect using state, nonce, and PKCE S256. Its independent
+  transaction ID remains in the bounded server-side record and binds the initiating browser only
+  through a short-lived opaque `__Host-oauth` cookie.
 - `GET /auth/callback` strictly consumes one success or denial callback. A success exchanges the
-  code confidentially, validates the ID/access tokens, calls `PUT /v1/me`, creates one Redis
-  session, sets `__Host-session`, and redirects with `303` to the canonical local target.
+  code only after the consumed transaction matches the browser binding, validates the ID/access
+  tokens, calls `PUT /v1/me`, creates one Redis session, sets `__Host-session`, clears the login
+  binding, and redirects with `303` to the canonical local target.
 
 The browser receives no OAuth token or identity value. The cookie is an independent 256-bit opaque
 identifier with `Secure`, `HttpOnly`, `SameSite=Lax`, `Path=/`, no `Domain`, and a bounded
@@ -24,7 +27,15 @@ authoritative Identity profile.
 
 Cookie-authenticated application routes, unsafe methods, CSRF, refresh/touch behavior, logout,
 revocation, and `/auth/signed-out` are intentionally absent. Cognito logout and Google logout
-semantics are therefore not implemented by this slice.
+semantics are therefore not implemented by this slice. The login/callback cookie binds one OAuth
+redemption to its initiating browser; it is not the deferred CSRF protection required before any
+future unsafe cookie-authenticated application method can exist.
+
+OAuth transport necessarily places state and nonce only on the outbound provider authorization
+request, then code/state or error/state only on the inbound callback request. None of the
+transaction ID, state, nonce, code, or error values continue into the final local `303`, response
+body, session cookie, other browser or application storage, logs, exceptions, representations,
+metrics, or review evidence.
 
 The packed runtime removes Python and operating-system package-manager tooling after its locked
 dependencies are installed. Packed-image validation proves that boundary along with non-root,
@@ -53,5 +64,6 @@ present, must match the exact access token.
 The repository Compose file supplies fixed disposable local credentials and Redis with persistence
 disabled. It binds the BFF on loopback port 8081 and Redis on a loopback-only test port. Packed
 validation starts an in-memory synthetic token/JWKS/Identity fixture, exercises success, denial,
-replay, provider/Identity/Redis outages and recovery, inspects the server-side session, and then
-removes the disposable stack. Production secrets and real provider access are not needed.
+cross-browser rejection, replay, provider/Identity/Redis outages and recovery, inspects the
+server-side session, and then removes the disposable stack. Production secrets and real provider
+access are not needed.

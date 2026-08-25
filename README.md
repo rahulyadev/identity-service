@@ -136,15 +136,22 @@ merely because the combined development environment contains both.
 The BFF exposes process liveness, Redis/JWKS-backed readiness, `GET /auth/login`, and
 `GET /auth/callback`. Login accepts one optional canonical local `return_to`, stores a fixed-lifetime
 one-time record before redirecting, and includes the exact Identity resource plus scope, state,
-nonce, and PKCE S256 bindings. Callback strictly consumes that record before denial or exchange,
-validates both Cognito tokens, completes `PUT /v1/me`, stores a versioned expiring Redis session,
-sets one opaque host-only `__Host-session` cookie, and redirects locally with `303`.
+nonce, and PKCE S256 bindings. The independent transaction ID remains in the bounded server-side
+record and appears in the browser only as a short-lived opaque `__Host-oauth` binding.
+Callback strictly consumes that record, requires a constant-time match to the initiating browser
+before denial or exchange, validates both Cognito tokens, completes `PUT /v1/me`, stores a
+versioned expiring Redis session, clears the binding, sets one opaque host-only `__Host-session`
+cookie, and redirects locally with `303`.
 
-The client secret, Redis credentials, code, raw state, nonce, verifier, transaction identifier,
-provider subjects, OAuth tokens, provider bodies, and session records are absent from browser
-storage, redirects, cookies, errors, metrics, and logs. Cookie-authenticated application/CSRF
-surfaces, refresh, logout, revocation, `/auth/signed-out`, real provider access, and deployment remain
-absent. See
+OAuth transport necessarily carries state and nonce only on the provider authorization request and
+code/state or error/state only on the callback request. None of the transaction ID, state, nonce,
+code, or error values propagate into the final local redirect, response body, session cookie, other
+browser or application storage, logs, exceptions, representations, metrics, or review evidence.
+The client secret, Redis credentials, verifier, provider subjects, OAuth tokens, provider bodies,
+and session records remain outside every public surface.
+The login/callback binding is not a substitute for CSRF protection on future unsafe
+cookie-authenticated methods. Those methods, application/session routes, CSRF, refresh, logout,
+revocation, `/auth/signed-out`, real provider access, and deployment remain absent. See
 [the standalone example](examples/reference_bff/README.md) for its configuration boundary.
 
 This Python runtime SBOM does not inventory operating-system or container-image packages.

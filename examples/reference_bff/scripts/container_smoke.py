@@ -223,13 +223,25 @@ def run(*arguments: str, check: bool = True) -> str:
     return result.stdout.strip()
 
 
-def request(path: str) -> tuple[int, dict[str, str], bytes]:
+def request(path: str, *, cookie: str | None = None) -> tuple[int, dict[str, str], bytes]:
     connection = http.client.HTTPConnection("127.0.0.1", 8081, timeout=3)
     try:
-        connection.request("GET", path, headers={"Host": "localhost", "Connection": "close"})
+        request_headers = {"Host": "localhost", "Connection": "close"}
+        if cookie is not None:
+            request_headers["Cookie"] = cookie
+        connection.request("GET", path, headers=request_headers)
         response = connection.getresponse()
         body = response.read(16_385)
-        headers = {name.casefold(): value for name, value in response.getheaders()}
+        headers: dict[str, str] = {}
+        cookies: list[str] = []
+        for name, value in response.getheaders():
+            normalized = name.casefold()
+            if normalized == "set-cookie":
+                cookies.append(value)
+            else:
+                headers[normalized] = value
+        if cookies:
+            headers["set-cookie"] = "\n".join(cookies)
         return response.status, headers, body
     finally:
         connection.close()
@@ -255,6 +267,39 @@ def assert_headers(headers: dict[str, str], *, allow_cookie: bool = False) -> No
         raise RuntimeError("BFF unexpectedly emitted CORS headers")
     if not allow_cookie and "set-cookie" in headers:
         raise RuntimeError("BFF unexpectedly emitted a cookie")
+
+
+def set_cookies(headers: dict[str, str]) -> list[str]:
+    value = headers.get("set-cookie")
+    return [] if value is None else value.split("\n")
+
+
+def oauth_binding_cookie(headers: dict[str, str]) -> str:
+    cookies = set_cookies(headers)
+    if len(cookies) != 1:
+        raise RuntimeError("packed BFF login cookie count differs")
+    match = re.fullmatch(
+        r"__Host-oauth=([A-Za-z0-9_-]{43}); HttpOnly; Max-Age=300; "
+        r"Path=/; SameSite=lax; Secure",
+        cookies[0],
+    )
+    if match is None or "Domain=" in cookies[0]:
+        raise RuntimeError("packed BFF binding cookie flags or lifetime differ")
+    return match.group(1)
+
+
+def assert_binding_clear(cookie: str) -> None:
+    if (
+        re.fullmatch(
+            r'__Host-oauth=""; expires=[A-Z][a-z]{2}, [0-9]{2} [A-Z][a-z]{2} '
+            r"[0-9]{4} [0-9]{2}:[0-9]{2}:[0-9]{2} GMT; HttpOnly; "
+            r"Max-Age=0; Path=/; SameSite=lax; Secure",
+            cookie,
+        )
+        is None
+        or "Domain=" in cookie
+    ):
+        raise RuntimeError("packed BFF binding clearing cookie differs")
 
 
 def main() -> int:
@@ -314,7 +359,8 @@ def main() -> int:
         login_status, login_headers, _login_body = request("/auth/login")
         if login_status != 307:
             raise RuntimeError("packed BFF login initiation failed")
-        assert_headers(login_headers)
+        assert_headers(login_headers, allow_cookie=True)
+        copied_binding = oauth_binding_cookie(login_headers)
         redirect = urlsplit(login_headers.get("location", ""))
         query = parse_qs(redirect.query, strict_parsing=True)
         if set(query) != {
@@ -336,16 +382,50 @@ def main() -> int:
         if re.search(r"(?i)(secret|verifier|transaction|redis|token)", redirect.query):
             raise RuntimeError("packed BFF redirect contains forbidden material")
 
+        copied_query = query
+        copied_path = (
+            f"/auth/callback?code={quote(FIXTURE_CODE, safe='-._~')}&state={query['state'][0]}"
+        )
+        events_before_copy = list(fixture.events)
+        copied_status, copied_headers, copied_body = request(copied_path)
+        if (
+            copied_status != 400
+            or json.loads(copied_body).get("code") != "invalid_oauth_transaction"
+            or "set-cookie" in copied_headers
+            or fixture.events != events_before_copy
+        ):
+            raise RuntimeError("packed BFF accepted a copied no-cookie callback")
+
+        login_status, login_headers, _login_body = request("/auth/login")
+        if login_status != 307:
+            raise RuntimeError("packed BFF matching login initiation failed")
+        assert_headers(login_headers, allow_cookie=True)
+        binding = oauth_binding_cookie(login_headers)
+        redirect = urlsplit(login_headers.get("location", ""))
+        query = parse_qs(redirect.query, strict_parsing=True)
         fixture.expected_nonce = query["nonce"][0]
         fixture.expected_challenge = query["code_challenge"][0]
         callback_path = (
             f"/auth/callback?code={quote(FIXTURE_CODE, safe='-._~')}&state={query['state'][0]}"
         )
-        callback_status, callback_headers, callback_body = request(callback_path)
+        callback_status, callback_headers, callback_body = request(
+            callback_path, cookie=f"__Host-oauth={binding}"
+        )
         if callback_status != 303 or callback_headers.get("location") != "/":
             raise RuntimeError("packed BFF callback did not return the safe local redirect")
         assert_headers(callback_headers, allow_cookie=True)
-        cookie = callback_headers.get("set-cookie", "")
+        cookies = set_cookies(callback_headers)
+        if len(cookies) != 2:
+            raise RuntimeError("packed BFF callback cookie count differs")
+        clearing_cookie = next(
+            (cookie for cookie in cookies if cookie.startswith('__Host-oauth="";')),
+            "",
+        )
+        cookie = next(
+            (cookie for cookie in cookies if cookie.startswith("__Host-session=")),
+            "",
+        )
+        assert_binding_clear(clearing_cookie)
         cookie_match = re.fullmatch(
             r"__Host-session=([A-Za-z0-9_-]{43}); HttpOnly; Max-Age=([0-9]+); "
             r"Path=/; SameSite=lax; Secure",
@@ -362,9 +442,13 @@ def main() -> int:
             FIXTURE_USER_ID,
             query["state"][0],
             fixture.expected_nonce,
+            binding,
+            copied_binding,
         )
         browser_surface = (
-            callback_body.decode(errors="replace") + callback_headers.get("location", "") + cookie
+            callback_body.decode(errors="replace")
+            + callback_headers.get("location", "")
+            + "".join(cookies)
         )
         if any(value and value in browser_surface for value in forbidden_browser_values):
             raise RuntimeError("packed BFF leaked server-side identity material to the browser")
@@ -393,7 +477,9 @@ def main() -> int:
         session_ttl = int(run(*COMPOSE, "exec", "-T", "redis", "redis-cli", "TTL", session_key))
         if not 0 < session_ttl <= 43_200:
             raise RuntimeError("packed BFF session TTL exceeds the idle bound")
-        replay_status, replay_headers, replay_body = request(callback_path)
+        replay_status, replay_headers, replay_body = request(
+            callback_path, cookie=f"__Host-oauth={binding}"
+        )
         if (
             replay_status != 400
             or json.loads(replay_body).get("code") != "invalid_oauth_transaction"
@@ -405,67 +491,92 @@ def main() -> int:
         denied_login_status, denied_login_headers, _denied_login_body = request("/auth/login")
         if denied_login_status != 307:
             raise RuntimeError("packed BFF denial setup failed")
+        assert_headers(denied_login_headers, allow_cookie=True)
+        denied_binding = oauth_binding_cookie(denied_login_headers)
         denied_query = parse_qs(urlsplit(denied_login_headers["location"]).query)
         events_before_denial = list(fixture.events)
         denied_status, denied_headers, denied_body = request(
-            f"/auth/callback?error=access_denied&state={denied_query['state'][0]}"
+            f"/auth/callback?error=access_denied&state={denied_query['state'][0]}",
+            cookie=f"__Host-oauth={denied_binding}",
         )
+        denied_cookies = set_cookies(denied_headers)
         if (
             denied_status != 400
             or json.loads(denied_body).get("code") != "authorization_denied"
             or "access_denied" in denied_body.decode()
-            or "set-cookie" in denied_headers
+            or len(denied_cookies) != 1
             or fixture.events != events_before_denial
         ):
             raise RuntimeError("packed BFF provider denial crossed the fixed boundary")
+        assert_binding_clear(denied_cookies[0])
 
         outage_login_status, outage_login_headers, _outage_login_body = request("/auth/login")
         if outage_login_status != 307:
             raise RuntimeError("packed BFF provider-outage setup failed")
+        assert_headers(outage_login_headers, allow_cookie=True)
+        outage_binding = oauth_binding_cookie(outage_login_headers)
         outage_query = parse_qs(urlsplit(outage_login_headers["location"]).query)
         fixture.expected_nonce = outage_query["nonce"][0]
         fixture.expected_challenge = outage_query["code_challenge"][0]
         fixture.token_available = False
         outage_status, outage_headers, outage_body = request(
-            f"/auth/callback?code={FIXTURE_CODE}&state={outage_query['state'][0]}"
+            f"/auth/callback?code={FIXTURE_CODE}&state={outage_query['state'][0]}",
+            cookie=f"__Host-oauth={outage_binding}",
         )
         fixture.token_available = True
+        outage_cookies = set_cookies(outage_headers)
         if (
             outage_status != 503
             or json.loads(outage_body).get("code") != "authentication_unavailable"
-            or "set-cookie" in outage_headers
+            or len(outage_cookies) != 1
         ):
             raise RuntimeError("packed BFF provider outage did not fail without a session")
+        assert_binding_clear(outage_cookies[0])
 
         recovery_login_status, recovery_login_headers, _recovery_login_body = request("/auth/login")
         if recovery_login_status != 307:
             raise RuntimeError("packed BFF provider recovery setup failed")
+        assert_headers(recovery_login_headers, allow_cookie=True)
+        recovery_binding = oauth_binding_cookie(recovery_login_headers)
         recovery_query = parse_qs(urlsplit(recovery_login_headers["location"]).query)
         fixture.expected_nonce = recovery_query["nonce"][0]
         fixture.expected_challenge = recovery_query["code_challenge"][0]
         fixture.identity_available = False
         identity_status, identity_headers, identity_body = request(
-            f"/auth/callback?code={FIXTURE_CODE}&state={recovery_query['state'][0]}"
+            f"/auth/callback?code={FIXTURE_CODE}&state={recovery_query['state'][0]}",
+            cookie=f"__Host-oauth={recovery_binding}",
         )
         fixture.identity_available = True
+        identity_cookies = set_cookies(identity_headers)
         if (
             identity_status != 503
             or json.loads(identity_body).get("code") != "identity_unavailable"
-            or "set-cookie" in identity_headers
+            or len(identity_cookies) != 1
         ):
             raise RuntimeError("packed BFF Identity outage did not fail without a session")
+        assert_binding_clear(identity_cookies[0])
 
         final_login_status, final_login_headers, _final_login_body = request("/auth/login")
         if final_login_status != 307:
             raise RuntimeError("packed BFF recovery login failed")
+        assert_headers(final_login_headers, allow_cookie=True)
+        final_binding = oauth_binding_cookie(final_login_headers)
         final_query = parse_qs(urlsplit(final_login_headers["location"]).query)
         fixture.expected_nonce = final_query["nonce"][0]
         fixture.expected_challenge = final_query["code_challenge"][0]
         final_status, final_headers, _final_body = request(
-            f"/auth/callback?code={FIXTURE_CODE}&state={final_query['state'][0]}"
+            f"/auth/callback?code={FIXTURE_CODE}&state={final_query['state'][0]}",
+            cookie=f"__Host-oauth={final_binding}",
         )
-        if final_status != 303 or "set-cookie" not in final_headers:
+        final_cookies = set_cookies(final_headers)
+        if final_status != 303 or len(final_cookies) != 2:
             raise RuntimeError("packed BFF did not recover after upstream outages")
+        assert_binding_clear(
+            next(
+                (cookie for cookie in final_cookies if cookie.startswith('__Host-oauth="";')),
+                "",
+            )
+        )
 
         run(*COMPOSE, "stop", "-t", "10", "redis")
         wait_for("/health/live", 200)
@@ -502,10 +613,30 @@ def main() -> int:
                 "id_token",
                 "refresh_token",
                 "synthetic-cognito-subject",
+                "__host-oauth",
+                "transaction_id",
             )
         ) or any(
             value and value in logs
-            for value in (fixture.access_token, fixture.id_token, fixture.refresh_token)
+            for value in (
+                fixture.access_token,
+                fixture.id_token,
+                fixture.refresh_token,
+                copied_binding,
+                binding,
+                denied_binding,
+                outage_binding,
+                recovery_binding,
+                final_binding,
+                copied_query["state"][0],
+                copied_query["nonce"][0],
+                query["state"][0],
+                query["nonce"][0],
+                denied_query["state"][0],
+                outage_query["state"][0],
+                recovery_query["state"][0],
+                final_query["state"][0],
+            )
         ):
             raise RuntimeError("packed BFF logs contain forbidden configuration material")
         print(
@@ -513,7 +644,8 @@ def main() -> int:
             f"image={image['Id']} redis={redis_digests[0]} uid_gid=10002:10002 "
             "read_only=true cap_drop=ALL no_new_privileges=true dependency_isolation=true "
             "package_managers_absent=true "
-            "callback_e2e=true bootstrap_before_session=true replay_rejected=true "
+            "callback_e2e=true browser_binding=true cross_browser_rejected=true "
+            "binding_cleanup=true bootstrap_before_session=true replay_rejected=true "
             "server_side_token_custody=true browser_token_storage_absent=true "
             "provider_identity_redis_outages=true recovery=true no_cors=true "
             f"shutdown_seconds={shutdown_seconds:.3f}"

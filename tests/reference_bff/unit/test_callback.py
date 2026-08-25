@@ -4,13 +4,17 @@ from urllib.parse import quote
 
 import pytest
 from reference_bff.callback import (
+    OAUTH_BINDING_COOKIE_NAME,
     CallbackDenied,
     CallbackSuccess,
     InvalidCallbackQueryError,
+    InvalidOAuthBrowserBindingError,
     parse_callback_query,
+    parse_oauth_browser_binding,
 )
 
 STATE = "A" * 43
+BINDING = "B" * 43
 
 
 def parse(query: bytes) -> CallbackSuccess | CallbackDenied:
@@ -101,3 +105,53 @@ def test_callback_enforces_predecode_and_per_value_size_bounds() -> None:
             max_code_bytes=4096,
             max_error_bytes=128,
         )
+
+
+def test_raw_cookie_parser_accepts_one_binding_and_unrelated_bounded_cookies() -> None:
+    binding = parse_oauth_browser_binding(
+        [
+            (b"host", b"testserver"),
+            (
+                b"cookie",
+                f"theme=dark; {OAUTH_BINDING_COOKIE_NAME}={BINDING}; padded=value==".encode(),
+            ),
+            (b"cookie", b"preference=compact"),
+        ]
+    )
+
+    assert binding.transaction_id == BINDING
+    assert BINDING not in repr(binding)
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        [],
+        [(b"cookie", b"theme=dark")],
+        [(b"cookie", b"")],
+        [(b"cookie", f"{OAUTH_BINDING_COOKIE_NAME}={'A' * 42}".encode())],
+        [(b"cookie", f"{OAUTH_BINDING_COOKIE_NAME}={'A' * 129}".encode())],
+        [(b"cookie", f"{OAUTH_BINDING_COOKIE_NAME}={BINDING}\x7f".encode())],
+        [(b"cookie", f"{OAUTH_BINDING_COOKIE_NAME}={BINDING};  theme=dark".encode())],
+        [(b"cookie", f"{OAUTH_BINDING_COOKIE_NAME}={BINDING}; malformed".encode())],
+        [
+            (
+                b"cookie",
+                f"{OAUTH_BINDING_COOKIE_NAME}={BINDING}; "
+                f"{OAUTH_BINDING_COOKIE_NAME}={BINDING}".encode(),
+            )
+        ],
+        [
+            (b"cookie", f"{OAUTH_BINDING_COOKIE_NAME}={BINDING}".encode()),
+            (b"cookie", f"{OAUTH_BINDING_COOKIE_NAME}={BINDING}".encode()),
+        ],
+        [(b"cookie", b"unrelated=" + b"x" * 8192)],
+    ],
+)
+def test_raw_cookie_parser_rejects_missing_malformed_control_duplicate_and_oversized_input(
+    headers: list[tuple[bytes, bytes]],
+) -> None:
+    with pytest.raises(InvalidOAuthBrowserBindingError) as captured:
+        parse_oauth_browser_binding(headers)
+
+    assert BINDING not in repr(captured.value)

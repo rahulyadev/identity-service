@@ -58,7 +58,7 @@ def pkce_s256_challenge(verifier: str) -> str:
     return base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, repr=False)
 class AuthorizationTransaction:
     transaction_id: str
     state: str
@@ -69,6 +69,9 @@ class AuthorizationTransaction:
     expires_at: int
     callback_uri: str
     version: int = TRANSACTION_SCHEMA_VERSION
+
+    def __repr__(self) -> str:
+        return "AuthorizationTransaction(<redacted>)"
 
     @property
     def code_challenge(self) -> str:

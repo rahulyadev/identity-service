@@ -15,6 +15,7 @@ class FakeTransactionStore:
         self.closed = False
         self.session_records: list[SessionRecord] = []
         self.session_handles: list[SessionHandle] = []
+        self.consume_failure: Exception | None = None
 
     async def create(self, return_to: str) -> AuthorizationTransaction:
         if not self.available:
@@ -31,7 +32,10 @@ class FakeTransactionStore:
     async def consume(self, state: str) -> AuthorizationTransaction | None:
         for index, transaction in enumerate(self.transactions):
             if transaction.state == state:
-                return self.transactions.pop(index)
+                consumed = self.transactions.pop(index)
+                if self.consume_failure is not None:
+                    raise self.consume_failure
+                return consumed
         return None
 
     async def create_session(self, record: SessionRecord) -> SessionHandle:

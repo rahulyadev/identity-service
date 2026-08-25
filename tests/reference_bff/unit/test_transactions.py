@@ -64,6 +64,9 @@ def test_record_contains_only_the_bounded_transaction_contract() -> None:
         "callback_uri",
     }
     assert "secret" not in document
+    rendered = repr(transaction)
+    assert rendered == "AuthorizationTransaction(<redacted>)"
+    assert all(str(value) not in rendered for value in document.values())
     assert (
         parse_consumed_transaction(
             transaction.as_json_bytes(),

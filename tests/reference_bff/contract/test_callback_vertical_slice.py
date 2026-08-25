@@ -44,12 +44,22 @@ def test_actual_callback_vertical_slice_issues_cookie_only_after_bootstrap_and_s
         transaction = store.transactions[0]
         provider.configure(transaction)
         state = parse_qs(urlsplit(login.headers["location"]).query)["state"][0]
-        callback = client.get(f"/auth/callback?code={provider.code}&state={state}")
+        copied = client.get(f"/auth/callback?code={provider.code}&state={state}")
+        second_login = client.get("/auth/login?return_to=%2Fprofile")
+        transaction = store.transactions[0]
+        provider.configure(transaction)
+        state = parse_qs(urlsplit(second_login.headers["location"]).query)["state"][0]
+        callback = client.get(
+            f"/auth/callback?code={provider.code}&state={state}",
+            headers={"cookie": f"__Host-oauth={transaction.transaction_id}"},
+        )
 
+    assert copied.status_code == 400
+    assert copied.json()["code"] == "invalid_oauth_transaction"
+    assert provider.events == ["token", "jwks", "identity"]
     assert callback.status_code == 303
     assert callback.headers["location"] == "/profile"
-    assert len(callback.headers.get_list("set-cookie")) == 1
-    assert provider.events == ["token", "jwks", "identity"]
+    assert len(callback.headers.get_list("set-cookie")) == 2
     assert len(store.session_records) == 1
     assert store.session_records[0].user_id == "1526af3c-c76a-4e01-a507-347205fb3c93"
     browser_surface = callback.text + callback.headers["location"] + callback.headers["set-cookie"]

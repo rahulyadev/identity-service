@@ -12,7 +12,8 @@ from reference_bff.config import Settings
 
 SENSITIVE_TEXT = re.compile(
     r"(?i)(?:client_secret|redis_url|state|nonce|code|code_verifier|pkce_verifier|"
-    r"transaction_id|authorization|access_token|id_token|refresh_token|session_id|"
+    r"transaction_id|oauth_binding|__host-oauth|cookie|authorization|access_token|id_token|"
+    r"refresh_token|session_id|"
     r"subject)\s*[=:]\s*[^\s,]+"
 )
 CREDENTIAL_URL = re.compile(r"(?i)(redis(?:s)?://)[^/@\s:]+(?::[^/@\s]*)?@")
