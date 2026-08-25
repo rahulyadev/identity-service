@@ -49,6 +49,12 @@ def test_valid_deployed_settings_require_secure_explicit_boundaries(
         log_format="json",
         enable_interactive_docs=False,
         authorization_endpoint="https://auth.example.invalid/oauth2/authorize",
+        token_endpoint="https://auth.example.invalid/oauth2/token",
+        cognito_issuer="https://cognito-idp.ap-south-1.amazonaws.com/ap-south-1_testpool",
+        cognito_jwks_url=(
+            "https://cognito-idp.ap-south-1.amazonaws.com/ap-south-1_testpool/.well-known/jwks.json"
+        ),
+        identity_api_origin="https://identity.example.invalid",
         redis_url="rediss://cache.example.invalid:6380/0",
         redis_key_namespace="reference-bff:production:oauth",
     )
@@ -82,6 +88,12 @@ def test_deployed_settings_reject_unsafe_boundaries(
         "log_format": "json",
         "enable_interactive_docs": False,
         "authorization_endpoint": "https://auth.example.invalid/oauth2/authorize",
+        "token_endpoint": "https://auth.example.invalid/oauth2/token",
+        "cognito_issuer": ("https://cognito-idp.ap-south-1.amazonaws.com/ap-south-1_testpool"),
+        "cognito_jwks_url": (
+            "https://cognito-idp.ap-south-1.amazonaws.com/ap-south-1_testpool/.well-known/jwks.json"
+        ),
+        "identity_api_origin": "https://identity.example.invalid",
         "redis_url": "rediss://cache.example.invalid/0",
         "redis_key_namespace": "reference-bff:production:oauth",
     }
@@ -95,6 +107,11 @@ def test_deployed_settings_reject_unsafe_boundaries(
     [
         {"bff_origin": "https://user:secret@bff.example.invalid"},  # pragma: allowlist secret
         {"authorization_endpoint": CREDENTIAL_AUTH_ENDPOINT},
+        {"token_endpoint": "https://other.invalid/oauth2/token"},
+        {"token_endpoint": "http://127.0.0.1:9000/not-token"},
+        {"cognito_jwks_url": "http://127.0.0.1:9000/other/.well-known/jwks.json"},
+        {"identity_api_origin": "http://127.0.0.1:9001/path"},
+        {"oauth_resource": "other://resource"},
         {"authorization_endpoint": "https://auth.example.invalid/oauth2/authorize#fragment"},
         {"bff_origin": "http://example.invalid", "allowed_hosts": ["example.invalid"]},
         {"authorization_endpoint": "http://example.invalid/oauth2/authorize"},
@@ -168,6 +185,8 @@ def test_strict_scalar_string_forms_are_accepted(
         {"redis_url": "redis://127.0.0.1:99999/0"},
         {"redis_url": " redis://127.0.0.1/0"},
         {"bff_origin": "http://127.0.0.1:8081", "allowed_hosts": ["localhost"]},
+        {"jwks_cache_max_age_seconds": 301, "jwks_stale_if_error_seconds": 300},
+        {"session_idle_seconds": 7200, "session_absolute_seconds": 3600},
     ],
 )
 def test_additional_strict_configuration_branches_reject(
@@ -186,6 +205,10 @@ def test_invalid_environment_input_is_hidden_during_startup() -> None:
             "BFF_ORIGIN": "http://localhost:8081",
             "ALLOWED_HOSTS": '["localhost"]',
             "AUTHORIZATION_ENDPOINT": "http://127.0.0.1:9000/oauth2/authorize",
+            "TOKEN_ENDPOINT": "http://127.0.0.1:9000/oauth2/token",
+            "COGNITO_ISSUER": "http://127.0.0.1:9000/test-pool",
+            "COGNITO_JWKS_URL": ("http://127.0.0.1:9000/test-pool/.well-known/jwks.json"),
+            "IDENTITY_API_ORIGIN": "http://127.0.0.1:9001",
             "BFF_CLIENT_ID": "synthetic-reference-client",
             "BFF_CLIENT_SECRET": sentinel,
             "REDIS_URL": f"redis://user:{sentinel}@127.0.0.1:56379/15",

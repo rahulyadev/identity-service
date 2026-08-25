@@ -1,4 +1,4 @@
-"""Application factory for the reference BFF transaction foundation."""
+"""Application factory for the reference BFF callback/session slice."""
 
 from __future__ import annotations
 
@@ -12,7 +12,18 @@ from fastapi.exceptions import RequestValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.responses import JSONResponse, RedirectResponse, Response
 
+from reference_bff.callback import (
+    CallbackDenied,
+    CallbackSuccess,
+    InvalidCallbackQueryError,
+    parse_callback_query,
+)
 from reference_bff.config import Settings
+from reference_bff.exchange import AuthorizationCodeClient
+from reference_bff.flow import CallbackCompleter, CallbackFlow, CallbackFlowError
+from reference_bff.http import AsyncUpstreamClient
+from reference_bff.identity import IdentityBootstrapClient
+from reference_bff.jwks import AsyncJwksCache
 from reference_bff.logging import configure_logging
 from reference_bff.middleware import SecurityBoundaryMiddleware, get_request_id
 from reference_bff.problems import PublicProblemError, problem_response
@@ -22,10 +33,15 @@ from reference_bff.store import (
     TransactionStore,
     TransactionStoreUnavailableError,
 )
+from reference_bff.tokens import CognitoTokenVerifier
+from reference_bff.transactions import ExpiredTransactionError, MalformedTransactionError
 
 
 def create_app(
-    settings: Settings | None = None, *, transaction_store: TransactionStore | None = None
+    settings: Settings | None = None,
+    *,
+    transaction_store: TransactionStore | None = None,
+    callback_service: CallbackCompleter | None = None,
 ) -> FastAPI:
     resolved = settings or Settings()
     configure_logging(resolved)
@@ -33,11 +49,29 @@ def create_app(
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         store = transaction_store or RedisTransactionStore.from_settings(resolved)
+        if callback_service is None:
+            upstream = AsyncUpstreamClient(resolved)
+            jwks = AsyncJwksCache(resolved, upstream)
+            service: CallbackCompleter = CallbackFlow(
+                settings=resolved,
+                upstream=upstream,
+                jwks=jwks,
+                exchange=AuthorizationCodeClient(resolved, upstream),
+                verifier=CognitoTokenVerifier(resolved, jwks),
+                identity=IdentityBootstrapClient(resolved, upstream),
+                store=store,
+            )
+        else:
+            service = callback_service
         app.state.transaction_store = store
+        app.state.callback_service = service
         try:
             yield
         finally:
-            await store.close()
+            try:
+                await service.close()
+            finally:
+                await store.close()
 
     docs_url = "/docs" if resolved.enable_interactive_docs else None
     app = FastAPI(
@@ -59,7 +93,8 @@ def create_app(
     @app.get("/health/ready", include_in_schema=False)
     async def readiness(request: Request) -> Response:
         store: TransactionStore = request.app.state.transaction_store
-        if not await store.ready():
+        service: CallbackCompleter = request.app.state.callback_service
+        if not await store.ready() or not await service.ready():
             return problem_response(
                 503, "transaction_store_unavailable", get_request_id(request.scope)
             )
@@ -85,6 +120,7 @@ def create_app(
                 ("client_id", resolved.client_id),
                 ("redirect_uri", resolved.callback_uri),
                 ("scope", " ".join(resolved.requested_scopes)),
+                ("resource", resolved.oauth_resource),
                 ("state", transaction.state),
                 ("nonce", transaction.nonce),
                 ("code_challenge", transaction.code_challenge),
@@ -93,6 +129,49 @@ def create_app(
         )
         logging.getLogger("reference_bff.http").info("authorization_transaction_created")
         return RedirectResponse(f"{resolved.authorization_endpoint}?{query}", status_code=307)
+
+    @app.get("/auth/callback", include_in_schema=False)
+    async def callback(request: Request) -> Response:
+        try:
+            callback_query = parse_callback_query(
+                request.scope.get("query_string", b""),
+                max_query_bytes=resolved.max_callback_query_bytes,
+                max_code_bytes=resolved.max_oauth_code_bytes,
+                max_error_bytes=resolved.max_provider_error_bytes,
+            )
+        except InvalidCallbackQueryError:
+            raise PublicProblemError(400, "invalid_callback") from None
+        store: TransactionStore = request.app.state.transaction_store
+        try:
+            transaction = await store.consume(callback_query.state)
+        except TransactionStoreUnavailableError:
+            raise PublicProblemError(503, "transaction_store_unavailable") from None
+        except MalformedTransactionError, ExpiredTransactionError:
+            raise PublicProblemError(400, "invalid_oauth_transaction") from None
+        if transaction is None:
+            raise PublicProblemError(400, "invalid_oauth_transaction")
+        if isinstance(callback_query, CallbackDenied):
+            logging.getLogger("reference_bff.http").info("authorization_denied")
+            raise PublicProblemError(400, "authorization_denied")
+        if not isinstance(callback_query, CallbackSuccess):
+            raise PublicProblemError(400, "invalid_callback")
+        service: CallbackCompleter = request.app.state.callback_service
+        try:
+            session = await service.complete(callback_query.code, transaction)
+        except CallbackFlowError as error:
+            raise PublicProblemError(error.status, error.code) from None
+        response = RedirectResponse(transaction.return_to, status_code=303)
+        response.set_cookie(
+            "__Host-session",
+            session.session_id,
+            max_age=session.max_age,
+            path="/",
+            secure=True,
+            httponly=True,
+            samesite="lax",
+        )
+        logging.getLogger("reference_bff.http").info("browser_session_created")
+        return response
 
     @app.exception_handler(PublicProblemError)
     async def public_problem_handler(request: Request, error: PublicProblemError) -> Response:

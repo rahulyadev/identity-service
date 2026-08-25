@@ -22,6 +22,8 @@ SCOPE_VALUE = re.compile(r"[^\x00-\x20\x7f*]{1,256}")
 OPAQUE_VALUE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._~:-]{0,255}")
 NAMESPACE_VALUE = re.compile(r"[a-z0-9][a-z0-9:_-]{2,95}")
 DNS_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
+COGNITO_REGIONAL_HOST = re.compile(r"cognito-idp\.[a-z0-9-]+\.amazonaws\.com")
+COGNITO_USER_POOL_PATH = re.compile(r"/[A-Za-z0-9_-]{1,128}")
 
 
 class BffEnvironment(StrEnum):
@@ -184,6 +186,11 @@ class Settings(BaseSettings):
     )
 
     authorization_endpoint: str = Field(validation_alias="AUTHORIZATION_ENDPOINT")
+    token_endpoint: str = Field(validation_alias="TOKEN_ENDPOINT", repr=False)
+    cognito_issuer: str = Field(validation_alias="COGNITO_ISSUER", repr=False)
+    cognito_jwks_url: str = Field(validation_alias="COGNITO_JWKS_URL", repr=False)
+    identity_api_origin: str = Field(validation_alias="IDENTITY_API_ORIGIN", repr=False)
+    oauth_resource: str = Field(default="identity-service://api", validation_alias="OAUTH_RESOURCE")
     client_id: str = Field(validation_alias="BFF_CLIENT_ID", repr=False)
     client_secret: SecretStr = Field(validation_alias="BFF_CLIENT_SECRET", repr=True)
     requested_scopes: list[str] = Field(
@@ -200,6 +207,61 @@ class Settings(BaseSettings):
     max_transaction_bytes: EnvInt = Field(
         default=8192, ge=1024, le=16_384, validation_alias="MAX_TRANSACTION_BYTES"
     )
+    max_callback_query_bytes: EnvInt = Field(
+        default=8192, ge=512, le=16_384, validation_alias="MAX_CALLBACK_QUERY_BYTES"
+    )
+    max_oauth_code_bytes: EnvInt = Field(
+        default=4096, ge=128, le=8192, validation_alias="MAX_OAUTH_CODE_BYTES"
+    )
+    max_provider_error_bytes: EnvInt = Field(
+        default=128, ge=32, le=256, validation_alias="MAX_PROVIDER_ERROR_BYTES"
+    )
+    upstream_connect_timeout_seconds: EnvInt = Field(
+        default=2, ge=1, le=30, validation_alias="UPSTREAM_CONNECT_TIMEOUT_SECONDS"
+    )
+    upstream_read_timeout_seconds: EnvInt = Field(
+        default=3, ge=1, le=30, validation_alias="UPSTREAM_READ_TIMEOUT_SECONDS"
+    )
+    upstream_write_timeout_seconds: EnvInt = Field(
+        default=3, ge=1, le=30, validation_alias="UPSTREAM_WRITE_TIMEOUT_SECONDS"
+    )
+    upstream_pool_timeout_seconds: EnvInt = Field(
+        default=2, ge=1, le=30, validation_alias="UPSTREAM_POOL_TIMEOUT_SECONDS"
+    )
+    upstream_max_response_bytes: EnvInt = Field(
+        default=65_536,
+        ge=1024,
+        le=1024 * 1024,
+        validation_alias="UPSTREAM_MAX_RESPONSE_BYTES",
+    )
+    jwt_clock_skew_seconds: EnvInt = Field(
+        default=60, ge=0, le=300, validation_alias="JWT_CLOCK_SKEW_SECONDS"
+    )
+    jwt_max_token_bytes: EnvInt = Field(
+        default=16_384, ge=256, le=65_536, validation_alias="JWT_MAX_TOKEN_BYTES"
+    )
+    jwks_cache_max_age_seconds: EnvInt = Field(
+        default=300, ge=1, le=86_400, validation_alias="JWKS_CACHE_MAX_AGE_SECONDS"
+    )
+    jwks_stale_if_error_seconds: EnvInt = Field(
+        default=1800, ge=1, le=86_400, validation_alias="JWKS_STALE_IF_ERROR_SECONDS"
+    )
+    jwks_refresh_min_interval_seconds: EnvInt = Field(
+        default=10, ge=1, le=300, validation_alias="JWKS_REFRESH_MIN_INTERVAL_SECONDS"
+    )
+    jwks_negative_kid_cache_seconds: EnvInt = Field(
+        default=10, ge=1, le=300, validation_alias="JWKS_NEGATIVE_KID_CACHE_SECONDS"
+    )
+    jwks_max_keys: EnvInt = Field(default=16, ge=1, le=64, validation_alias="JWKS_MAX_KEYS")
+    session_idle_seconds: EnvInt = Field(
+        default=43_200, ge=300, le=86_400, validation_alias="SESSION_IDLE_SECONDS"
+    )
+    session_absolute_seconds: EnvInt = Field(
+        default=604_800, ge=3600, le=2_419_200, validation_alias="SESSION_ABSOLUTE_SECONDS"
+    )
+    max_session_bytes: EnvInt = Field(
+        default=65_536, ge=4096, le=262_144, validation_alias="MAX_SESSION_BYTES"
+    )
 
     @field_validator("service_version")
     @classmethod
@@ -214,10 +276,28 @@ class Settings(BaseSettings):
         _split_http_url(value, "BFF_ORIGIN", origin=True)
         return value
 
-    @field_validator("authorization_endpoint")
+    @field_validator(
+        "authorization_endpoint",
+        "token_endpoint",
+        "cognito_issuer",
+        "cognito_jwks_url",
+    )
     @classmethod
-    def validate_authorization_endpoint(cls, value: str) -> str:
-        _split_http_url(value, "AUTHORIZATION_ENDPOINT", origin=False)
+    def validate_provider_endpoint(cls, value: str, info: Any) -> str:
+        _split_http_url(value, (info.field_name or "provider_endpoint").upper(), origin=False)
+        return value
+
+    @field_validator("identity_api_origin")
+    @classmethod
+    def validate_identity_api_origin(cls, value: str) -> str:
+        _split_http_url(value, "IDENTITY_API_ORIGIN", origin=True)
+        return value
+
+    @field_validator("oauth_resource")
+    @classmethod
+    def validate_oauth_resource(cls, value: str) -> str:
+        if value != "identity-service://api":
+            raise ValueError("OAUTH_RESOURCE must use the fixed Identity resource identifier")
         return value
 
     @field_validator("allowed_hosts")
@@ -288,17 +368,50 @@ class Settings(BaseSettings):
         provider = _split_http_url(
             self.authorization_endpoint, "AUTHORIZATION_ENDPOINT", origin=False
         )
+        token = _split_http_url(self.token_endpoint, "TOKEN_ENDPOINT", origin=False)
+        issuer = _split_http_url(self.cognito_issuer, "COGNITO_ISSUER", origin=False)
+        jwks = _split_http_url(self.cognito_jwks_url, "COGNITO_JWKS_URL", origin=False)
+        identity_api = _split_http_url(self.identity_api_origin, "IDENTITY_API_ORIGIN", origin=True)
         redis = _split_redis_url(self.redis_url.get_secret_value())
         if _validate_host(origin.hostname or "") not in self.allowed_hosts:
             raise ValueError("BFF_ORIGIN host must be explicitly allowed")
         required_namespace = f"reference-bff:{self.app_env.value}:"
         if not self.redis_key_namespace.startswith(required_namespace):
             raise ValueError("REDIS_KEY_NAMESPACE must identify this application and environment")
+        provider_authority = (provider.scheme, provider.hostname, provider.port)
+        if (
+            provider.path != "/oauth2/authorize"
+            or (
+                token.scheme,
+                token.hostname,
+                token.port,
+            )
+            != provider_authority
+            or token.path != "/oauth2/token"
+        ):
+            raise ValueError(
+                "managed-login endpoints must share one authority and exact OAuth paths"
+            )
+        if self.cognito_jwks_url != self.cognito_issuer.rstrip("/") + "/.well-known/jwks.json":
+            raise ValueError("COGNITO_JWKS_URL must exactly match the configured issuer")
+        if self.jwks_stale_if_error_seconds < self.jwks_cache_max_age_seconds:
+            raise ValueError("JWKS_STALE_IF_ERROR_SECONDS must include the fresh-cache lifetime")
+        if self.session_absolute_seconds < self.session_idle_seconds:
+            raise ValueError("SESSION_ABSOLUTE_SECONDS must not be shorter than the idle lifetime")
         if self.app_env.deployed:
             if origin.scheme != "https" or _is_loopback(origin.hostname or ""):
                 raise ValueError("deployed BFF_ORIGIN requires non-loopback HTTPS")
-            if provider.scheme != "https" or _is_loopback(provider.hostname or ""):
-                raise ValueError("deployed AUTHORIZATION_ENDPOINT requires non-loopback HTTPS")
+            provider_urls = (provider, token, issuer, jwks, identity_api)
+            if any(
+                parsed.scheme != "https" or _is_loopback(parsed.hostname or "")
+                for parsed in provider_urls
+            ):
+                raise ValueError("deployed upstream endpoints require non-loopback HTTPS")
+            if (
+                COGNITO_REGIONAL_HOST.fullmatch(issuer.hostname or "") is None
+                or COGNITO_USER_POOL_PATH.fullmatch(issuer.path) is None
+            ):
+                raise ValueError("COGNITO_ISSUER must identify one regional Cognito User Pool")
             if redis.scheme != "rediss" or _is_loopback(redis.hostname or ""):
                 raise ValueError("deployed REDIS_URL requires non-loopback TLS transport")
             if (
@@ -310,8 +423,11 @@ class Settings(BaseSettings):
         else:
             if origin.scheme == "http" and not _is_loopback(origin.hostname or ""):
                 raise ValueError("plain HTTP BFF_ORIGIN is limited to loopback fixtures")
-            if provider.scheme == "http" and not _is_loopback(provider.hostname or ""):
-                raise ValueError("plain HTTP provider endpoints are limited to loopback fixtures")
+            if any(
+                parsed.scheme == "http" and not _is_loopback(parsed.hostname or "")
+                for parsed in (provider, token, issuer, jwks, identity_api)
+            ):
+                raise ValueError("plain HTTP upstream endpoints are limited to loopback fixtures")
         return self
 
     @property
@@ -327,8 +443,15 @@ class Settings(BaseSettings):
             "allowed_hosts": list(self.allowed_hosts),
             "trusted_proxy_networks": [str(network) for network in self.trusted_proxy_networks],
             "authorization_endpoint": self.authorization_endpoint,
+            "token_endpoint": self.token_endpoint,
+            "cognito_issuer": self.cognito_issuer,
+            "cognito_jwks_url": self.cognito_jwks_url,
+            "identity_api_origin": self.identity_api_origin,
+            "oauth_resource": self.oauth_resource,
             "callback_uri": self.callback_uri,
             "requested_scopes": list(self.requested_scopes),
             "redis_key_namespace": self.redis_key_namespace,
             "oauth_transaction_ttl_seconds": self.oauth_transaction_ttl_seconds,
+            "session_idle_seconds": self.session_idle_seconds,
+            "session_absolute_seconds": self.session_absolute_seconds,
         }

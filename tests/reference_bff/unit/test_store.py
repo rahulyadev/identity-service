@@ -3,11 +3,13 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Callable
+from dataclasses import replace
 from typing import Any
 
 import pytest
 from redis.exceptions import ConnectionError as RedisConnectionError
 from reference_bff.config import Settings
+from reference_bff.sessions import SessionRecord
 from reference_bff.store import (
     READINESS_TTL_SECONDS,
     RedisTransactionStore,
@@ -60,6 +62,22 @@ class FakeRedis:
 
 def run(coroutine: Any) -> Any:
     return asyncio.run(coroutine)
+
+
+def session_record(*, now: int = 1_900_000_000) -> SessionRecord:
+    return SessionRecord(
+        issuer="http://127.0.0.1:9000/test-pool",
+        subject="synthetic-subject",
+        client_id="synthetic-reference-client",
+        user_id="1526af3c-c76a-4e01-a507-347205fb3c93",
+        access_token="synthetic-access-token",
+        id_token="synthetic-id-token-value",
+        refresh_token="synthetic-refresh-token",
+        access_expires_at=now + 900,
+        created_at=now,
+        last_activity_at=now,
+        absolute_expires_at=now + 604_800,
+    )
 
 
 def test_create_uses_digest_key_atomic_nx_and_fixed_expiry(
@@ -118,6 +136,64 @@ def test_getdel_consumes_exactly_once_without_extending_ttl(
     assert missing is None
     assert redis.getdel_calls == [store.key_for_state(transaction.state)] * 2
     assert len(redis.set_calls) == 1
+
+
+def test_session_uses_independent_opaque_cookie_digest_key_and_bounded_record(
+    bff_settings_factory: Callable[..., Settings],
+) -> None:
+    settings = bff_settings_factory()
+    redis = FakeRedis()
+    store = RedisTransactionStore(settings, redis, clock=lambda: 1_900_000_000.0)
+
+    handle = run(store.create_session(session_record()))
+
+    assert len(handle.session_id) == 43
+    assert handle.max_age == settings.session_idle_seconds == 43_200
+    assert len(redis.set_calls) == 1
+    key, serialized, nx, expiry = redis.set_calls[0]
+    assert handle.session_id not in key
+    assert handle.session_id.encode() not in serialized
+    assert key == store.key_for_session_id(handle.session_id)
+    assert key.startswith("reference-bff:test:pytest:session:")
+    assert nx is True
+    assert expiry == handle.max_age
+    document = json.loads(serialized)
+    assert document["version"] == 1
+    assert document["refresh_version"] == 0
+    assert document["access_token"] == "synthetic-access-token"
+    assert len(serialized) <= settings.max_session_bytes
+
+
+def test_session_ttl_is_capped_by_absolute_remainder_and_collisions_are_bounded(
+    bff_settings_factory: Callable[..., Settings],
+) -> None:
+    redis = FakeRedis()
+    redis.set_results = [None, None, True]
+    store = RedisTransactionStore(bff_settings_factory(), redis, clock=lambda: 1_900_000_100.0)
+    record = replace(session_record(), absolute_expires_at=1_900_000_250)
+
+    handle = run(store.create_session(record))
+
+    assert len(redis.set_calls) == 3
+    assert handle.max_age == 150
+    assert {call[3] for call in redis.set_calls} == {150}
+    assert len({call[0] for call in redis.set_calls}) == 3
+
+
+def test_session_storage_outage_and_exhausted_lifetime_fail_closed(
+    bff_settings_factory: Callable[..., Settings],
+) -> None:
+    redis = FakeRedis()
+    redis.raise_errors = True
+    store = RedisTransactionStore(bff_settings_factory(), redis, clock=lambda: 1_900_000_000.0)
+    with pytest.raises(TransactionStoreUnavailableError):
+        run(store.create_session(session_record()))
+    expired = session_record(now=1_899_000_000)
+    available = RedisTransactionStore(
+        bff_settings_factory(), FakeRedis(), clock=lambda: 1_900_000_000.0
+    )
+    with pytest.raises(TransactionStoreUnavailableError):
+        run(available.create_session(expired))
 
 
 @pytest.mark.parametrize(
@@ -192,12 +268,14 @@ def test_readiness_uses_unique_dedicated_set_nx_ex_getdel_probe(
     assert run(store.ready()) is True
     assert run(store.ready()) is True
 
-    assert len(redis.set_calls) == 2
-    assert len(redis.getdel_calls) == 2
+    assert len(redis.set_calls) == 4
+    assert len(redis.getdel_calls) == 4
     assert {call[0] for call in redis.set_calls} == set(redis.getdel_calls)
-    assert len({call[0] for call in redis.set_calls}) == 2
+    assert len({call[0] for call in redis.set_calls}) == 4
     assert all(":readiness:" in call[0] for call in redis.set_calls)
     assert all(":oauth-transaction:" not in call[0] for call in redis.set_calls)
+    assert sum(call[0].endswith(":oauth-transaction") for call in redis.set_calls) == 2
+    assert sum(call[0].endswith(":session") for call in redis.set_calls) == 2
     assert all(call[2] is True and call[3] == READINESS_TTL_SECONDS for call in redis.set_calls)
     assert redis.values == {}
 

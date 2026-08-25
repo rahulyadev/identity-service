@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 from urllib.parse import parse_qs, quote, urlsplit
 
+import httpx2
+from fastapi import FastAPI
 from reference_bff.app import create_app
 from reference_bff.config import Settings
+from reference_bff.flow import CallbackFlowError
 
 from tests.http_client import ASGIClient
-from tests.reference_bff.fakes import FakeTransactionStore
+from tests.reference_bff.fakes import FakeCallbackService, FakeTransactionStore
 
 SECURITY_HEADERS = {
     "cache-control": "no-store",
@@ -19,12 +23,20 @@ SECURITY_HEADERS = {
 }
 
 
+def callback_app(settings: Settings, store: FakeTransactionStore) -> FastAPI:
+    return create_app(
+        settings,
+        transaction_store=store,
+        callback_service=FakeCallbackService(),
+    )
+
+
 def test_login_persists_before_exact_temporary_redirect(
     bff_settings_factory: Callable[..., Settings],
 ) -> None:
     settings = bff_settings_factory()
     store = FakeTransactionStore(settings)
-    app = create_app(settings, transaction_store=store)
+    app = callback_app(settings, store)
     return_to = "/profile?tab=security"
     with ASGIClient(app) as client:
         response = client.get(f"/auth/login?return_to={quote(return_to, safe='')}")
@@ -41,6 +53,7 @@ def test_login_persists_before_exact_temporary_redirect(
         "client_id",
         "redirect_uri",
         "scope",
+        "resource",
         "state",
         "nonce",
         "code_challenge",
@@ -51,6 +64,7 @@ def test_login_persists_before_exact_temporary_redirect(
         "client_id": [settings.client_id],
         "redirect_uri": [settings.callback_uri],
         "scope": [" ".join(settings.requested_scopes)],
+        "resource": [settings.oauth_resource],
         "state": [transaction.state],
         "nonce": [transaction.nonce],
         "code_challenge": [transaction.code_challenge],
@@ -73,7 +87,7 @@ def test_fifty_logins_have_independent_unique_browser_and_server_values(
 ) -> None:
     settings = bff_settings_factory()
     store = FakeTransactionStore(settings)
-    with ASGIClient(create_app(settings, transaction_store=store)) as client:
+    with ASGIClient(callback_app(settings, store)) as client:
         responses = [client.get("/auth/login") for _ in range(50)]
 
     assert all(response.status_code == 307 for response in responses)
@@ -85,13 +99,119 @@ def test_fifty_logins_have_independent_unique_browser_and_server_values(
     assert len({transaction.pkce_verifier for transaction in store.transactions}) == 50
 
 
+def test_callback_consumes_once_then_sets_one_exact_opaque_host_cookie(
+    bff_settings_factory: Callable[..., Settings],
+) -> None:
+    settings = bff_settings_factory()
+    store = FakeTransactionStore(settings)
+    service = FakeCallbackService()
+    app = create_app(settings, transaction_store=store, callback_service=service)
+    with ASGIClient(app) as client:
+        login = client.get("/auth/login?return_to=%2Fprofile")
+        state = parse_qs(urlsplit(login.headers["location"]).query)["state"][0]
+        code = quote("synthetic/code=value", safe="-._~")
+        callback = client.get(f"/auth/callback?code={code}&state={state}")
+        replay = client.get(f"/auth/callback?code={code}&state={state}")
+
+    assert callback.status_code == 303
+    assert callback.headers["location"] == "/profile"
+    cookies = callback.headers.get_list("set-cookie")
+    assert len(cookies) == 1
+    cookie = cookies[0]
+    assert cookie.startswith(f"__Host-session={service.handle.session_id};")
+    assert "Path=/" in cookie
+    assert "Max-Age=43200" in cookie
+    assert "HttpOnly" in cookie
+    assert "Secure" in cookie
+    assert "SameSite=lax" in cookie
+    assert "Domain=" not in cookie
+    assert "access_token" not in cookie
+    assert len(service.calls) == 1
+    assert service.calls[0][0] == "synthetic/code=value"
+    assert replay.status_code == 400
+    assert replay.json()["code"] == "invalid_oauth_transaction"
+    assert "set-cookie" not in replay.headers
+
+
+def test_provider_denial_consumes_without_exchange_session_cookie_or_reflection(
+    bff_settings_factory: Callable[..., Settings],
+) -> None:
+    settings = bff_settings_factory()
+    store = FakeTransactionStore(settings)
+    service = FakeCallbackService()
+    app = create_app(settings, transaction_store=store, callback_service=service)
+    with ASGIClient(app) as client:
+        login = client.get("/auth/login")
+        state = parse_qs(urlsplit(login.headers["location"]).query)["state"][0]
+        denied = client.get(f"/auth/callback?error=access_denied&state={state}")
+        replay = client.get(f"/auth/callback?error=access_denied&state={state}")
+
+    assert denied.status_code == 400
+    assert denied.json()["code"] == "authorization_denied"
+    assert "access_denied" not in denied.text
+    assert "set-cookie" not in denied.headers
+    assert service.calls == []
+    assert replay.json()["code"] == "invalid_oauth_transaction"
+
+
+def test_callback_failure_never_sets_cookie_or_redirects(
+    bff_settings_factory: Callable[..., Settings],
+) -> None:
+    settings = bff_settings_factory()
+    store = FakeTransactionStore(settings)
+    service = FakeCallbackService()
+    service.failure = CallbackFlowError(503, "authentication_unavailable")
+    app = create_app(settings, transaction_store=store, callback_service=service)
+    with ASGIClient(app) as client:
+        login = client.get("/auth/login")
+        state = parse_qs(urlsplit(login.headers["location"]).query)["state"][0]
+        response = client.get(f"/auth/callback?code=synthetic-code&state={state}")
+
+    assert response.status_code == 503
+    assert response.json()["code"] == "authentication_unavailable"
+    assert "set-cookie" not in response.headers
+    assert "location" not in response.headers
+
+
+def test_twenty_concurrent_duplicate_callbacks_have_exactly_one_completion(
+    bff_settings_factory: Callable[..., Settings],
+) -> None:
+    settings = bff_settings_factory()
+    store = FakeTransactionStore(settings)
+    service = FakeCallbackService()
+    app = create_app(settings, transaction_store=store, callback_service=service)
+
+    async def scenario() -> list[httpx2.Response]:
+        async with (
+            app.router.lifespan_context(app),
+            httpx2.AsyncClient(
+                transport=httpx2.ASGITransport(app=app),
+                base_url="http://testserver",
+            ) as client,
+        ):
+            login = await client.get("/auth/login")
+            state = parse_qs(urlsplit(login.headers["location"]).query)["state"][0]
+            return await asyncio.gather(
+                *(
+                    client.get(f"/auth/callback?code=synthetic-code&state={state}")
+                    for _ in range(20)
+                )
+            )
+
+    responses = asyncio.run(scenario())
+    assert sum(response.status_code == 303 for response in responses) == 1
+    assert sum(response.status_code == 400 for response in responses) == 19
+    assert sum("set-cookie" in response.headers for response in responses) == 1
+    assert len(service.calls) == 1
+
+
 def test_no_redirect_occurs_when_redis_persistence_fails(
     bff_settings_factory: Callable[..., Settings],
 ) -> None:
     settings = bff_settings_factory()
     store = FakeTransactionStore(settings)
     store.available = False
-    with ASGIClient(create_app(settings, transaction_store=store)) as client:
+    with ASGIClient(callback_app(settings, store)) as client:
         response = client.get("/auth/login")
     assert response.status_code == 503
     assert "location" not in response.headers
@@ -105,7 +225,7 @@ def test_liveness_is_dependency_free_and_readiness_tracks_store_recovery(
     settings = bff_settings_factory()
     store = FakeTransactionStore(settings)
     store.available = False
-    with ASGIClient(create_app(settings, transaction_store=store)) as client:
+    with ASGIClient(callback_app(settings, store)) as client:
         live = client.get("/health/live")
         unavailable = client.get("/health/ready")
         store.available = True
@@ -119,12 +239,31 @@ def test_liveness_is_dependency_free_and_readiness_tracks_store_recovery(
     assert store.closed
 
 
+def test_readiness_tracks_usable_jwks_without_weakening_liveness(
+    bff_settings_factory: Callable[..., Settings],
+) -> None:
+    settings = bff_settings_factory()
+    store = FakeTransactionStore(settings)
+    service = FakeCallbackService()
+    service.available = False
+    app = create_app(settings, transaction_store=store, callback_service=service)
+    with ASGIClient(app) as client:
+        live = client.get("/health/live")
+        unavailable = client.get("/health/ready")
+        service.available = True
+        ready = client.get("/health/ready")
+    assert live.status_code == 200
+    assert unavailable.status_code == 503
+    assert ready.status_code == 200
+    assert service.closed
+
+
 def test_all_response_classes_receive_restrictive_headers_without_cors(
     bff_settings_factory: Callable[..., Settings],
 ) -> None:
     settings = bff_settings_factory()
     store = FakeTransactionStore(settings)
-    with ASGIClient(create_app(settings, transaction_store=store)) as client:
+    with ASGIClient(callback_app(settings, store)) as client:
         responses = [
             client.get("/health/live"),
             client.get("/missing"),
@@ -138,14 +277,16 @@ def test_all_response_classes_receive_restrictive_headers_without_cors(
         assert "set-cookie" not in response.headers
 
 
-def test_callback_session_and_logout_routes_are_absent(
+def test_only_callback_is_added_while_deferred_surfaces_remain_absent(
     bff_settings_factory: Callable[..., Settings],
 ) -> None:
     settings = bff_settings_factory()
     store = FakeTransactionStore(settings)
-    with ASGIClient(create_app(settings, transaction_store=store)) as client:
+    with ASGIClient(callback_app(settings, store)) as client:
+        callback = client.get("/auth/callback")
+        assert callback.status_code == 400
+        assert callback.json()["code"] == "invalid_callback"
         for path in (
-            "/auth/callback",
             "/auth/logout",
             "/auth/signed-out",
             "/session",
@@ -162,7 +303,7 @@ def test_host_and_request_id_validation_are_bounded_and_nonreflective(
 ) -> None:
     settings = bff_settings_factory()
     store = FakeTransactionStore(settings)
-    app = create_app(settings, transaction_store=store)
+    app = callback_app(settings, store)
     with ASGIClient(app) as client:
         accepted = client.get("/health/live", headers={"x-request-id": "safe-request-123"})
         invalid_request_id = client.get("/health/live", headers={"x-request-id": "x" * 65})

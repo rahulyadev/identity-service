@@ -5,13 +5,15 @@ concurrency-safe internal identity/profile service, strict Cognito access-token 
 bounded JWKS cache, a subject-bound UserInfo adapter, an authenticated profile HTTP API,
 operational endpoints, migrations, observability, local containers, and automated checks.
 
-The separately packaged `examples/reference_bff` application demonstrates browser login initiation
-with Redis-backed one-time authorization transactions and PKCE. It is not an Identity service
-import or runtime dependency, and it listens independently on local port 8081.
+The separately packaged `examples/reference_bff` application demonstrates browser login,
+confidential callback exchange, independent Cognito token validation, Identity bootstrap, and an
+opaque Redis-backed host session. It is not an Identity service import or runtime dependency, and
+it listens independently on local port 8081.
 
-The service does not provide Google token validation, browser login, callback, session, cookie, or
-logout behavior. Bearer-authenticated profile access is intended for server-side consumers; direct
-browser integration remains unsupported.
+The Identity service itself does not provide Google token validation or browser sessions. Its
+Bearer-authenticated profile API remains server-to-server; the reference BFF owns the browser
+callback and cookie boundary. Refresh, CSRF-protected application routes, logout, and real-provider
+integration remain outside the current reference slice.
 
 ## Current contract
 
@@ -20,7 +22,7 @@ browser integration remains unsupported.
 - Provider identities resolve only by the exact, case-sensitive `(issuer, subject)` pair. Subjects
   are opaque text; email is profile data and is never an identity key.
 - PostgreSQL is authoritative. The Identity service does not use Redis; the standalone reference
-  BFF uses Redis only for disposable login transactions.
+  BFF uses Redis only for disposable login transactions and opaque server-side sessions.
 - Provider-owned profile fields are replaced by the latest supplied internal snapshot; omitted
   optional fields are cleared. A user-owned display-name override is preserved.
 - `PUT /v1/me` initializes or synchronizes the exact authenticated identity through UserInfo.
@@ -131,15 +133,18 @@ merely because the combined development environment contains both.
 
 ## Reference BFF surface
 
-The BFF exposes only process liveness, Redis-backed readiness, and `GET /auth/login`. Login accepts
-one optional canonical local `return_to`, stores a fixed-lifetime one-time record before redirecting,
-and sends only the authorization-code, client, callback, scope, state, nonce, and PKCE S256 fields
-to the provider. It sets no cookie and enables no CORS.
+The BFF exposes process liveness, Redis/JWKS-backed readiness, `GET /auth/login`, and
+`GET /auth/callback`. Login accepts one optional canonical local `return_to`, stores a fixed-lifetime
+one-time record before redirecting, and includes the exact Identity resource plus scope, state,
+nonce, and PKCE S256 bindings. Callback strictly consumes that record before denial or exchange,
+validates both Cognito tokens, completes `PUT /v1/me`, stores a versioned expiring Redis session,
+sets one opaque host-only `__Host-session` cookie, and redirects locally with `303`.
 
-The client secret, Redis credentials, raw state, nonce, verifier, transaction identifier, and Redis
-key are absent from redirects, errors, metrics, and logs. Callback handling, provider exchange,
-token validation, Identity bootstrap, sessions, CSRF application flows, refresh, and logout remain
-absent and return ordinary not-found problems. See
+The client secret, Redis credentials, code, raw state, nonce, verifier, transaction identifier,
+provider subjects, OAuth tokens, provider bodies, and session records are absent from browser
+storage, redirects, cookies, errors, metrics, and logs. Cookie-authenticated application/CSRF
+surfaces, refresh, logout, revocation, `/auth/signed-out`, real provider access, and deployment remain
+absent. See
 [the standalone example](examples/reference_bff/README.md) for its configuration boundary.
 
 This Python runtime SBOM does not inventory operating-system or container-image packages.

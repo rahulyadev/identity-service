@@ -14,6 +14,7 @@ from redis.asyncio import Redis
 from redis.exceptions import RedisError
 
 from reference_bff.config import Settings
+from reference_bff.sessions import SessionHandle, SessionRecord, opaque_session_id
 from reference_bff.transactions import (
     OPAQUE_TOKEN,
     AuthorizationTransaction,
@@ -46,6 +47,8 @@ class TransactionStore(Protocol):
     async def create(self, return_to: str) -> AuthorizationTransaction: ...
 
     async def consume(self, state: str) -> AuthorizationTransaction | None: ...
+
+    async def create_session(self, record: SessionRecord) -> SessionHandle: ...
 
     async def ready(self) -> bool: ...
 
@@ -86,6 +89,12 @@ class RedisTransactionStore:
 
     def _readiness_key(self, probe_id: str) -> str:
         return f"{self._settings.redis_key_namespace}:readiness:{probe_id}"
+
+    def key_for_session_id(self, session_id: str) -> str:
+        digest = hashlib.sha256(
+            f"{self._settings.redis_key_namespace}\x00session\x00{session_id}".encode()
+        ).hexdigest()
+        return f"{self._settings.redis_key_namespace}:session:{digest}"
 
     async def create(self, return_to: str) -> AuthorizationTransaction:
         for _ in range(MAX_COLLISION_ATTEMPTS):
@@ -132,24 +141,54 @@ class RedisTransactionStore:
             now=int(self._clock()),
         )
 
+    async def create_session(self, record: SessionRecord) -> SessionHandle:
+        serialized = record.as_json_bytes()
+        if len(serialized) > self._settings.max_session_bytes:
+            raise TransactionStoreUnavailableError("session record is too large")
+        now = int(self._clock())
+        max_age = min(
+            self._settings.session_idle_seconds,
+            record.absolute_expires_at - now,
+        )
+        if max_age <= 0:
+            raise TransactionStoreUnavailableError("session lifetime is exhausted")
+        for _ in range(MAX_COLLISION_ATTEMPTS):
+            session_id = opaque_session_id()
+            try:
+                async with asyncio.timeout(self._settings.redis_operation_timeout_seconds):
+                    created = await self._client.set(
+                        self.key_for_session_id(session_id),
+                        serialized,
+                        nx=True,
+                        ex=max_age,
+                    )
+            except RedisError, TimeoutError, OSError:
+                raise TransactionStoreUnavailableError("session storage unavailable") from None
+            if created is True:
+                return SessionHandle(session_id=session_id, max_age=max_age)
+        raise TransactionCollisionError("session storage unavailable")
+
     async def ready(self) -> bool:
-        probe_id = secrets.token_hex(32)
-        marker = secrets.token_bytes(32)
-        key = self._readiness_key(probe_id)
-        try:
-            async with asyncio.timeout(self._settings.redis_operation_timeout_seconds):
-                created = await self._client.set(
-                    key,
-                    marker,
-                    nx=True,
-                    ex=READINESS_TTL_SECONDS,
-                )
-                if created is not True:
-                    return False
-                consumed = await self._client.getdel(key)
-        except RedisError, TimeoutError, OSError:
-            return False
-        return type(consumed) is bytes and hmac.compare_digest(consumed, marker)
+        for operation in ("oauth-transaction", "session"):
+            probe_id = secrets.token_hex(32)
+            marker = secrets.token_bytes(32)
+            key = f"{self._readiness_key(probe_id)}:{operation}"
+            try:
+                async with asyncio.timeout(self._settings.redis_operation_timeout_seconds):
+                    created = await self._client.set(
+                        key,
+                        marker,
+                        nx=True,
+                        ex=READINESS_TTL_SECONDS,
+                    )
+                    if created is not True:
+                        return False
+                    consumed = await self._client.getdel(key)
+            except RedisError, TimeoutError, OSError:
+                return False
+            if type(consumed) is not bytes or not hmac.compare_digest(consumed, marker):
+                return False
+        return True
 
     async def close(self) -> None:
         try:

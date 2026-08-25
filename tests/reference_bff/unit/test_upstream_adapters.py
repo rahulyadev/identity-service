@@ -1,0 +1,164 @@
+from __future__ import annotations
+
+import asyncio
+from collections.abc import Callable
+from typing import Any, cast
+
+import httpx2
+import pytest
+from reference_bff.config import Settings
+from reference_bff.exchange import AuthorizationCodeClient, CodeExchangeUnavailableError
+from reference_bff.http import AsyncUpstreamClient
+from reference_bff.identity import IdentityBootstrapClient, IdentityBootstrapUnavailableError
+from reference_bff.transactions import new_transaction
+
+from tests.reference_bff.provider import SyntheticProvider
+
+
+def run(coroutine: Any) -> Any:
+    return asyncio.run(coroutine)
+
+
+def configured(
+    bff_settings_factory: Callable[..., Settings],
+) -> tuple[Settings, SyntheticProvider, AsyncUpstreamClient]:
+    settings = bff_settings_factory()
+    provider = SyntheticProvider(settings)
+    transaction = new_transaction(
+        return_to="/",
+        callback_uri=settings.callback_uri,
+        ttl_seconds=settings.oauth_transaction_ttl_seconds,
+    )
+    provider.configure(transaction)
+    transport = cast(httpx2.AsyncBaseTransport, httpx2.MockTransport(provider.handle))
+    return settings, provider, AsyncUpstreamClient(settings, transport=transport)
+
+
+def test_code_exchange_uses_exact_confidential_pkce_request_and_redacted_result(
+    bff_settings_factory: Callable[..., Settings],
+) -> None:
+    settings, provider, upstream = configured(bff_settings_factory)
+    assert provider.transaction is not None
+    exchange = AuthorizationCodeClient(settings, upstream)
+
+    async def scenario() -> None:
+        result = await exchange.exchange(provider.code, provider.transaction)
+        assert result.access_token == provider.access_token
+        assert result.id_token == provider.id_token
+        assert result.refresh_token == provider.refresh_token
+        rendered = repr(result)
+        assert provider.access_token not in rendered
+        assert provider.id_token not in rendered
+        assert provider.refresh_token not in rendered
+        await upstream.close()
+
+    run(scenario())
+    assert provider.events == ["token"]
+
+
+@pytest.mark.parametrize(
+    ("mode", "value"),
+    [
+        ("status", 503),
+        ("media", "text/plain"),
+        ("missing", None),
+        ("expires", True),
+        ("type", "DPoP"),
+        ("scope", "bad\nvalue"),
+    ],
+)
+def test_code_exchange_rejects_status_media_shape_numeric_and_token_type_abuse(
+    bff_settings_factory: Callable[..., Settings], mode: str, value: object
+) -> None:
+    settings, provider, upstream = configured(bff_settings_factory)
+    assert provider.transaction is not None
+    if mode == "status":
+        provider.token_status = int(value)  # type: ignore[arg-type]
+    elif mode == "media":
+        provider.token_content_type = str(value)
+    else:
+        document = {
+            "access_token": provider.access_token,
+            "id_token": provider.id_token,
+            "refresh_token": provider.refresh_token,
+            "token_type": "Bearer",
+            "expires_in": 900,
+        }
+        if mode == "missing":
+            document.pop("id_token")
+        elif mode == "expires":
+            document["expires_in"] = value
+        elif mode == "type":
+            document["token_type"] = value
+        else:
+            document["scope"] = value
+        provider.token_document = document
+    exchange = AuthorizationCodeClient(settings, upstream)
+
+    async def scenario() -> None:
+        with pytest.raises(CodeExchangeUnavailableError) as captured:
+            await exchange.exchange(provider.code, provider.transaction)
+        assert provider.code not in str(captured.value)
+        assert settings.client_secret.get_secret_value() not in str(captured.value)
+        await upstream.close()
+
+    run(scenario())
+
+
+@pytest.mark.parametrize("status", [200, 201])
+def test_identity_bootstrap_accepts_only_existing_minimal_profile(
+    status: int, bff_settings_factory: Callable[..., Settings]
+) -> None:
+    settings, provider, upstream = configured(bff_settings_factory)
+    provider.identity_status = status
+    identity = IdentityBootstrapClient(settings, upstream)
+
+    async def scenario() -> None:
+        profile = await identity.bootstrap(provider.access_token)
+        assert profile.user_id == "1526af3c-c76a-4e01-a507-347205fb3c93"
+        assert profile.created is (status == 201)
+        await upstream.close()
+
+    run(scenario())
+    assert provider.events == ["identity"]
+
+
+@pytest.mark.parametrize("mode", ["status", "media", "uuid", "extra", "version", "timestamp"])
+def test_identity_bootstrap_rejects_unsafe_status_media_and_profile_shapes(
+    bff_settings_factory: Callable[..., Settings], mode: str
+) -> None:
+    settings, provider, upstream = configured(bff_settings_factory)
+    if mode == "status":
+        provider.identity_status = 503
+    elif mode == "media":
+        provider.identity_content_type = "text/plain"
+    else:
+        now = "2026-08-25T00:00:00+00:00"
+        document: dict[str, Any] = {
+            "user_id": "1526af3c-c76a-4e01-a507-347205fb3c93",
+            "email": None,
+            "email_verified": True,
+            "display_name": None,
+            "avatar_url": None,
+            "version": 1,
+            "created_at": now,
+            "updated_at": now,
+        }
+        if mode == "uuid":
+            document["user_id"] = "not-a-uuid"
+        elif mode == "extra":
+            document["subject"] = "forbidden"
+        elif mode == "version":
+            document["version"] = True
+        else:
+            document["created_at"] = "not-a-time"
+        provider.identity_document = document
+    identity = IdentityBootstrapClient(settings, upstream)
+
+    async def scenario() -> None:
+        with pytest.raises(IdentityBootstrapUnavailableError) as captured:
+            await identity.bootstrap(provider.access_token)
+        assert provider.access_token not in str(captured.value)
+        await upstream.close()
+
+    run(scenario())
