@@ -1,0 +1,169 @@
+name: identity-service
+
+services:
+  db:
+    image: postgres:18.4-bookworm
+    environment:
+      POSTGRES_DB: identity_service
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: localpostgres # pragma: allowlist secret (fixed disposable local credential)
+      POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256 --auth-local=trust
+    ports:
+      - "127.0.0.1:55432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql
+      - ./docker/init/001_identity_roles.sql:/docker-entrypoint-initdb.d/001_identity_roles.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d identity_service"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  migrate:
+    image: identity-service:local
+    build:
+      context: .
+      target: runtime
+    environment:
+      DATABASE_URL: postgresql+psycopg://identity_service_migrator:localmigrator@db:5432/identity_service # pragma: allowlist secret (fixed disposable local credential)
+    depends_on:
+      db:
+        condition: service_healthy
+    command: ["python", "scripts/migrate_local.py"]
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+
+  app:
+    image: identity-service:local
+    build:
+      context: .
+      target: runtime
+    environment:
+      APP_ENV: local
+      SERVICE_VERSION: 0.1.0
+      PORT: "8080"
+      IDENTITY_ORIGIN: http://identity.test:8080
+      ALLOWED_HOSTS: '["identity.test","localhost"]'
+      TRUSTED_PROXY_CIDRS: '[]'
+      MAX_REQUEST_BODY_BYTES: "16384"
+      LOG_LEVEL: INFO
+      LOG_FORMAT: console
+      METRICS_ENABLED: "true"
+      COGNITO_ISSUER: ${COGNITO_ISSUER:-http://host.docker.internal:9000/test-pool}
+      COGNITO_JWKS_URL: ${COGNITO_JWKS_URL:-http://host.docker.internal:9000/test-pool/.well-known/jwks.json}
+      COGNITO_USERINFO_URL: ${COGNITO_USERINFO_URL:-http://host.docker.internal:9000/oauth2/userInfo}
+      COGNITO_ALLOWED_CLIENT_IDS: '${COGNITO_ALLOWED_CLIENT_IDS:-["test-client"]}'
+      OAUTH_RESOURCE: ${OAUTH_RESOURCE:-identity-service://api}
+      OAUTH_PROFILE_READ_SCOPE: ${OAUTH_PROFILE_READ_SCOPE:-identity-service://api/profile.read}
+      OAUTH_PROFILE_WRITE_SCOPE: ${OAUTH_PROFILE_WRITE_SCOPE:-identity-service://api/profile.write}
+      JWT_CLOCK_SKEW_SECONDS: "60"
+      JWT_MAX_TOKEN_BYTES: "16384"
+      JWKS_CACHE_MAX_AGE_SECONDS: ${JWKS_CACHE_MAX_AGE_SECONDS:-300}
+      JWKS_STALE_IF_ERROR_SECONDS: ${JWKS_STALE_IF_ERROR_SECONDS:-1800}
+      JWKS_REFRESH_MIN_INTERVAL_SECONDS: ${JWKS_REFRESH_MIN_INTERVAL_SECONDS:-10}
+      JWKS_NEGATIVE_KID_CACHE_SECONDS: "10"
+      JWKS_MAX_KEYS: "16"
+      UPSTREAM_CONNECT_TIMEOUT_SECONDS: "2"
+      UPSTREAM_READ_TIMEOUT_SECONDS: "3"
+      UPSTREAM_WRITE_TIMEOUT_SECONDS: "3"
+      UPSTREAM_POOL_TIMEOUT_SECONDS: "2"
+      UPSTREAM_MAX_RESPONSE_BYTES: "65536"
+      DATABASE_URL: postgresql+psycopg://identity_service_app:localapp@db:5432/identity_service # pragma: allowlist secret (fixed disposable local credential)
+      DB_POOL_SIZE: "5"
+      DB_MAX_OVERFLOW: "10"
+      DB_POOL_TIMEOUT_SECONDS: "5"
+      DB_POOL_RECYCLE_SECONDS: "1800"
+      DB_STATEMENT_TIMEOUT_MS: "2000"
+      DB_CONNECT_TIMEOUT_SECONDS: "3"
+      GRACEFUL_SHUTDOWN_SECONDS: "15"
+      ENABLE_INTERACTIVE_DOCS: "true"
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    init: true
+
+  test:
+    build:
+      context: .
+      target: test
+    environment:
+      TEST_DATABASE_URL: postgresql+psycopg://identity_service_app:localapp@db:5432/identity_service # pragma: allowlist secret (fixed disposable local credential)
+      TEST_MIGRATOR_DATABASE_URL: postgresql+psycopg://identity_service_migrator:localmigrator@db:5432/identity_service # pragma: allowlist secret (fixed disposable local credential)
+      TEST_DATABASE_ADMIN_URL: postgresql+psycopg://postgres:localpostgres@db:5432/postgres # pragma: allowlist secret (fixed disposable local credential)
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    command: ["python", "-m", "pytest", "-q"]
+    profiles: ["tools"]
+
+  redis:
+    image: redis:8.2.1-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--dir", "/tmp"]
+    working_dir: /tmp
+    ports:
+      - "127.0.0.1:56379:6379"
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  bff:
+    image: reference-bff:local
+    build:
+      context: .
+      dockerfile: examples/reference_bff/Dockerfile
+      target: runtime
+    environment:
+      APP_ENV: local
+      SERVICE_VERSION: 0.1.0
+      PORT: "8081"
+      BFF_ORIGIN: http://localhost:8081
+      ALLOWED_HOSTS: '["localhost","127.0.0.1"]'
+      TRUSTED_PROXY_NETWORKS: '[]'
+      LOG_LEVEL: INFO
+      LOG_FORMAT: console
+      ENABLE_INTERACTIVE_DOCS: "false"
+      GRACEFUL_SHUTDOWN_SECONDS: "15"
+      REDIS_CONNECT_TIMEOUT_SECONDS: "1"
+      REDIS_OPERATION_TIMEOUT_SECONDS: "1"
+      AUTHORIZATION_ENDPOINT: http://127.0.0.1:9000/oauth2/authorize
+      BFF_CLIENT_ID: synthetic-reference-client
+      BFF_CLIENT_SECRET: local-reference-client-secret # pragma: allowlist secret (fixed disposable local credential)
+      REQUESTED_SCOPES: '["openid","identity-service://api/profile.read","identity-service://api/profile.write"]'
+      REDIS_URL: redis://redis:6379/0
+      REDIS_KEY_NAMESPACE: reference-bff:local:compose
+      OAUTH_TRANSACTION_TTL_SECONDS: "300"
+      MAX_RETURN_TO_BYTES: "2048"
+      MAX_TRANSACTION_BYTES: "8192"
+    ports:
+      - "127.0.0.1:8081:8081"
+    depends_on:
+      redis:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+
+volumes:
+  postgres-data:

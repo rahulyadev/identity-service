@@ -1,0 +1,93 @@
+[build-system]
+requires = ["hatchling==1.32.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "identity-service"
+version = "0.1.0"
+description = "Internal identity data service foundation"
+readme = "README.md"
+requires-python = ">=3.14.4,<3.15"
+dependencies = [
+  "alembic==1.19.1",
+  "fastapi==0.141.1",
+  "httpx2==2.12.0",
+  "prometheus-client==0.26.0",
+  "psycopg[binary]==3.3.4",
+  "pydantic==2.13.4",
+  "pydantic-settings==2.15.0",
+  "PyJWT[crypto]==2.13.0",
+  "sqlalchemy==2.0.52",
+  "uvicorn==0.52.3",
+]
+
+[project.optional-dependencies]
+dev = [
+  "bandit==1.9.4",
+  "detect-secrets==1.5.0",
+  "editables==0.6",
+  "hatchling==1.32.0",
+  "mypy==2.3.1",
+  "pip-audit==2.10.1",
+  "pip-tools==7.6.1",
+  "pytest==9.1.1",
+  "pytest-cov==7.1.0",
+  "pytest-timeout==2.4.0",
+  "redis==8.1.0",
+  "ruff==0.16.3",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/identity_service"]
+
+[tool.ruff]
+target-version = "py314"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "ASYNC", "C4", "N", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["S101"]
+
+[tool.mypy]
+python_version = "3.14"
+strict = true
+packages = ["identity_service", "reference_bff"]
+mypy_path = "src:examples/reference_bff/src"
+plugins = ["pydantic.mypy"]
+warn_unreachable = true
+
+[[tool.mypy.overrides]]
+module = ["prometheus_client.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+addopts = [
+  "--strict-config",
+  "--strict-markers",
+  "--timeout=30",
+]
+testpaths = ["tests"]
+pythonpath = ["src", "examples/reference_bff/src"]
+markers = [
+  "integration: requires the disposable PostgreSQL 18.x test service",
+  "migration: exercises Alembic against an isolated disposable database",
+  "redis_integration: requires the disposable Redis test service",
+]
+
+[tool.coverage.run]
+branch = true
+source = ["identity_service"]
+
+[tool.coverage.report]
+fail_under = 90
+show_missing = true
+skip_covered = true
+exclude_also = [
+  "if TYPE_CHECKING:",
+]
+
+[tool.bandit]
+targets = ["src", "scripts"]
+exclude_dirs = ["tests"]

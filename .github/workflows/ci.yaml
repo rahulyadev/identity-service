@@ -1,0 +1,104 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      TEST_DATABASE_URL: postgresql+psycopg://identity_service_app:localapp@localhost:55432/identity_service # pragma: allowlist secret (fixed CI-only credential)
+      TEST_MIGRATOR_DATABASE_URL: postgresql+psycopg://identity_service_migrator:localmigrator@localhost:55432/identity_service # pragma: allowlist secret (fixed CI-only credential)
+      TEST_DATABASE_ADMIN_URL: postgresql+psycopg://postgres:localpostgres@localhost:55432/postgres # pragma: allowlist secret (fixed CI-only credential)
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install exact Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: 3.14.4
+          check-latest: false
+
+      - name: Verify interpreter
+        run: python3 --version | grep -Fx 'Python 3.14.4'
+
+      - name: Install locked dependencies
+        run: make sync
+
+      - name: Verify installed dependency consistency
+        run: make pip-check
+
+      - name: Verify dependency locks are reproducible
+        run: |
+          make lock
+          git diff --exit-code -- requirements.lock requirements-dev.lock examples/reference_bff/requirements.lock
+
+      - name: Format, lint, and type-check
+        run: |
+          make format-check
+          make lint
+          make typecheck
+
+      - name: Start PostgreSQL 18.4, Redis 8.2.1, and migrate
+        run: |
+          make db-up
+          make redis-up
+          make migrate
+
+      - name: Validate migrations
+        run: |
+          make migration-heads
+          make test-migrations
+          make migration-drift
+
+      - name: Run unit, contract, security, and integration tests
+        run: |
+          make test-unit
+          make test-contract
+          make test-security
+          make test-bff-unit
+          make test-bff-contract
+          make test-bff-security
+          make test-bff-redis
+          make test-integration
+
+      - name: Enforce branch coverage
+        run: |
+          make coverage
+          make coverage-bff
+
+      - name: Check deterministic OpenAPI
+        run: make openapi-check
+
+      - name: Generate and validate runtime SBOM
+        run: make sbom-check
+
+      - name: Run dependency, secret, and static security scans
+        run: make security
+
+      - name: Check patch hygiene
+        run: git diff --check
+
+      - name: Build production image
+        run: |
+          make docker-build
+          make docker-build-bff
+
+      - name: Smoke-test packed image
+        run: |
+          make docker-smoke
+          make docker-smoke-bff
+
+      - name: Stop disposable services
+        if: always()
+        run: docker compose down --volumes --remove-orphans
