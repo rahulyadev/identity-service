@@ -14,6 +14,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 LOCKS = (
     ("requirements.in", "requirements.lock"),
+    ("examples/reference_bff/requirements.in", "examples/reference_bff/requirements.lock"),
     ("requirements-dev.in", "requirements-dev.lock"),
 )
 
@@ -58,6 +59,7 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="identity-service-lock-check-") as temporary:
         directory = Path(temporary)
         for input_name, _ in LOCKS:
+            (directory / input_name).parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(ROOT / input_name, directory / input_name)
         for input_name, output_name in LOCKS:
             _compile(input_name, output_name, directory)

@@ -97,3 +97,19 @@ def test_actual_runtime_and_development_locks_have_expected_boundary() -> None:
     assert set(runtime) < set(development)
     assert "pytest" not in runtime
     assert "pytest" in development
+
+
+def test_reference_bff_runtime_lock_is_separate_and_exactly_development_covered() -> None:
+    identity_runtime = check_sbom.locked_components(check_sbom.ROOT / "requirements.lock")
+    bff_runtime = check_sbom.locked_components(
+        check_sbom.ROOT / "examples/reference_bff/requirements.lock"
+    )
+    development = check_sbom.locked_components(check_sbom.ROOT / "requirements-dev.lock")
+
+    assert bff_runtime == {name: development[name] for name in bff_runtime}
+    assert "redis" in bff_runtime
+    assert "redis" not in identity_runtime
+    assert "sqlalchemy" not in bff_runtime
+    assert "psycopg" not in bff_runtime
+    assert "pytest" not in bff_runtime
+    assert set(bff_runtime) < set(development)

@@ -109,5 +109,61 @@ services:
     command: ["python", "-m", "pytest", "-q"]
     profiles: ["tools"]
 
+  redis:
+    image: redis:8.2.1-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--dir", "/tmp"]
+    working_dir: /tmp
+    ports:
+      - "127.0.0.1:56379:6379"
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  bff:
+    image: reference-bff:local
+    build:
+      context: .
+      dockerfile: examples/reference_bff/Dockerfile
+      target: runtime
+    environment:
+      APP_ENV: local
+      SERVICE_VERSION: 0.1.0
+      PORT: "8081"
+      BFF_ORIGIN: http://localhost:8081
+      ALLOWED_HOSTS: '["localhost","127.0.0.1"]'
+      TRUSTED_PROXY_NETWORKS: '[]'
+      LOG_LEVEL: INFO
+      LOG_FORMAT: console
+      ENABLE_INTERACTIVE_DOCS: "false"
+      GRACEFUL_SHUTDOWN_SECONDS: "15"
+      REDIS_CONNECT_TIMEOUT_SECONDS: "1"
+      REDIS_OPERATION_TIMEOUT_SECONDS: "1"
+      AUTHORIZATION_ENDPOINT: http://127.0.0.1:9000/oauth2/authorize
+      BFF_CLIENT_ID: synthetic-reference-client
+      BFF_CLIENT_SECRET: local-reference-client-secret # pragma: allowlist secret (fixed disposable local credential)
+      REQUESTED_SCOPES: '["openid","identity-service://api/profile.read","identity-service://api/profile.write"]'
+      REDIS_URL: redis://redis:6379/0
+      REDIS_KEY_NAMESPACE: reference-bff:local:compose
+      OAUTH_TRANSACTION_TTL_SECONDS: "300"
+      MAX_RETURN_TO_BYTES: "2048"
+      MAX_TRANSACTION_BYTES: "8192"
+    ports:
+      - "127.0.0.1:8081:8081"
+    depends_on:
+      redis:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+
 volumes:
   postgres-data:

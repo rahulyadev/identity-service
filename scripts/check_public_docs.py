@@ -9,6 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 PUBLIC_FILES = (
     ROOT / "README.md",
     *(sorted((ROOT / "docs").glob("*.md"))),
+    ROOT / "examples" / "reference_bff" / "README.md",
     ROOT / "src" / "identity_service" / "app.py",
     ROOT / "openapi" / "openapi.json",
 )

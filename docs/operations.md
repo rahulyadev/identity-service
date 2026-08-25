@@ -109,6 +109,25 @@ and production, while `/openapi.json` remains available as the stable machine-re
 `make validate-local` is the complete gate and fails at one explicit prerequisite check when Docker
 is unavailable. `make validate` aliases that complete gate rather than the offline subset.
 
+## Reference BFF operation
+
+The standalone BFF listens on 8081. Its liveness endpoint is process-only; readiness performs one
+bounded Redis operation and recovers after the disposable store returns. Redis persistence is
+disabled in the local Compose profile and its test port is bound only to loopback. Losing Redis
+invalidates pending login attempts and does not lose durable identity data.
+
+`make test-bff-redis` exercises real atomic creation and consumption, fixed expiry, malformed-record
+removal, namespace isolation, pool cleanup, and fifty-way consume concurrency. `make coverage-bff`
+enforces an independent branch threshold. `make docker-smoke-bff` builds the separate runtime image,
+starts only disposable Redis and the BFF, verifies login initiation and restrictive headers, proves
+liveness/readiness separation during an outage and recovery, checks the non-root/read-only/
+capability-dropped package boundary, and requires bounded SIGTERM shutdown.
+
+The packed BFF image contains neither Identity source nor development/package-management tooling.
+Its provider URL is not contacted by this functionality. Deployed configuration requires HTTPS,
+TLS Redis transport, explicit non-loopback destinations, JSON logging, and disabled interactive
+documentation.
+
 The packed-image smoke gate sends bounded raw HTTP/1.1 requests directly to Uvicorn/h11 and rejects
 ambiguous `Content-Length`, `Transfer-Encoding`, and chunk framing if they produce a successful or
 second response. A clean connection must remain healthy after each rejection. Production edge and
@@ -121,6 +140,10 @@ package in `requirements.lock`. `make sbom-check` compares normalized names and 
 runtime lock, rejects development-only components, and scans for credentials and local paths. The
 normal artifact lives under ignored `.cache/security` output. It does not include base-image or
 operating-system packages; release infrastructure may combine it with an image-level inventory.
+
+`make bff-sbom-check` generates and validates the independent BFF inventory from
+`examples/reference_bff/requirements.lock`. The combined development lock is used only to prove
+that development-only packages do not leak into either runtime inventory.
 
 ## CI
 

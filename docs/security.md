@@ -49,6 +49,15 @@
   merge-patch member, and atomic optimistic versioning. Every exact profile-path response uses
   `no-store`; fixed Bearer challenges and bounded `Retry-After`/`Allow` values are the only preserved
   failure headers. No CORS middleware is enabled.
+- The standalone reference BFF generates independent 256-bit state, nonce, and transaction IDs plus
+  a longer RFC 7636 verifier. Only the S256 challenge crosses the browser redirect boundary.
+- BFF authorization records use a validated application/environment namespace, state-derived digest
+  keys, atomic create/consume operations, fixed expiry, strict bounded UTF-8 JSON, and fail-closed
+  Redis handling. Consumed malformed records remain consumed.
+- BFF local return targets reject absolute, authority, encoded-authority, fragment, backslash,
+  control, traversal, duplicate-query, invalid-encoding, oversized, and noncanonical forms.
+- Every BFF response is `no-store`, no-referrer, frame-denied, `nosniff`, and restrictive-CSP; host
+  and request-ID inputs are bounded, no CORS or cookie is enabled, and logs use a redacting pipeline.
 
 The metrics endpoint is unauthenticated and must be restricted by infrastructure. There is no CORS
 middleware and direct browser access is unsupported.
@@ -71,9 +80,10 @@ deployed configuration can select its HTTP/loopback endpoints.
 
 ## Not implemented
 
-There is no Google token validation, OAuth authorization code flow, PKCE, state, nonce, callback,
-refresh, logout, cookie, session, account linking, username and password, public deletion/export, or
-production authentication bypass/mock.
+The Identity service has no browser OAuth behavior. The standalone BFF stops after authorization
+transaction persistence and provider redirect: there is no callback handling, authorization-code
+exchange, token validation, UserInfo/profile bootstrap, refresh, logout, cookie, session, account
+linking, username and password, public deletion/export, or production authentication bypass/mock.
 
 No token, authorization code, provider claim document, password, browser session, business role, or
 permission is persisted. Logs omit authorization/cookie headers, tokens, provider identifiers,

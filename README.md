@@ -5,6 +5,10 @@ concurrency-safe internal identity/profile service, strict Cognito access-token 
 bounded JWKS cache, a subject-bound UserInfo adapter, an authenticated profile HTTP API,
 operational endpoints, migrations, observability, local containers, and automated checks.
 
+The separately packaged `examples/reference_bff` application demonstrates browser login initiation
+with Redis-backed one-time authorization transactions and PKCE. It is not an Identity service
+import or runtime dependency, and it listens independently on local port 8081.
+
 The service does not provide Google token validation, browser login, callback, session, cookie, or
 logout behavior. Bearer-authenticated profile access is intended for server-side consumers; direct
 browser integration remains unsupported.
@@ -15,7 +19,8 @@ browser integration remains unsupported.
   changes.
 - Provider identities resolve only by the exact, case-sensitive `(issuer, subject)` pair. Subjects
   are opaque text; email is profile data and is never an identity key.
-- PostgreSQL is authoritative. Redis is not used.
+- PostgreSQL is authoritative. The Identity service does not use Redis; the standalone reference
+  BFF uses Redis only for disposable login transactions.
 - Provider-owned profile fields are replaced by the latest supplied internal snapshot; omitted
   optional fields are cleared. A user-owned display-name override is preserved.
 - `PUT /v1/me` initializes or synchronizes the exact authenticated identity through UserInfo.
@@ -42,8 +47,10 @@ wheel and verifies its committed SHA-256 before extracting it into `.venv`.
 make sync
 ```
 
-`requirements.lock` is the production dependency set. `requirements-dev.lock` contains the exact
-validation toolchain. Regenerate both with `make lock` and review the diff.
+`requirements.lock` is the Identity production dependency set.
+`examples/reference_bff/requirements.lock` is the separate BFF production dependency set.
+`requirements-dev.lock` contains the combined exact validation toolchain. Regenerate all three
+with `make lock` and review the diff.
 
 ## Local PostgreSQL and application
 
@@ -82,16 +89,23 @@ make typecheck         run strict mypy
 make test-unit         run unit tests
 make test-contract     run HTTP/OpenAPI contract tests
 make test-security     run focused security tests
+make test-bff-unit     run BFF primitive and configuration tests
+make test-bff-contract run BFF HTTP contract tests
+make test-bff-security run BFF security and redaction tests
+make test-bff-redis    run one-time-store tests against disposable Redis
 make test-integration  run PostgreSQL service tests
 make test-migrations   run disposable upgrade/downgrade/re-upgrade tests
 make coverage          enforce branch-aware 90% overall coverage
+make coverage-bff      enforce independent BFF branch-aware 90% coverage
 make openapi           regenerate openapi/openapi.json
 make openapi-check     compare generated OpenAPI with the committed artifact
 make sbom              generate the runtime dependency CycloneDX JSON under .cache/security
 make sbom-check        validate the SBOM component set against requirements.lock
+make bff-sbom-check    validate the separate BFF runtime SBOM and lock
 make security          dependency audit, SBOM, documentation, secret, and Bandit checks
 make docker-build      build the production runtime image
 make docker-smoke      test the packed image, outage recovery, hardening, and shutdown
+make docker-smoke-bff  test the packed BFF with disposable Redis and outage recovery
 make validate-offline  run checks that need no PostgreSQL or application container
 make validate-local    run the complete local validation sequence
 make validate          alias the complete local validation sequence
@@ -100,8 +114,9 @@ make validate          alias the complete local validation sequence
 Database test commands require the three `TEST_*_DATABASE_URL` values used by the Makefile. They
 fail rather than substituting SQLite or skipping required tests. `make validate-offline` makes no
 release-readiness claim. Both `make validate-local` and `make validate` require Docker immediately,
-then run PostgreSQL migrations, every test class, full branch coverage, the production-image build,
-and packed-image smoke checks; neither can succeed after only the offline subset.
+then run PostgreSQL migrations, disposable Redis integration, every test class, independent branch
+coverage for both packages, both production-image builds, and both packed-image smoke checks;
+neither can succeed after only the offline subset.
 
 ## Runtime dependency SBOM
 
@@ -109,6 +124,23 @@ and packed-image smoke checks; neither can succeed after only the offline subset
 packages in `requirements.lock`. Packages that exist only in `requirements-dev.lock` are excluded,
 and the check rejects stale components, credentials, private repository references, and local
 workspace paths. Normal output is written beneath the ignored `.cache/security` directory.
+
+`make bff-sbom-check` applies the same semantic and secret-safe checks to the exact packages in the
+standalone BFF runtime lock. Neither runtime inventory may acquire packages from the other runtime
+merely because the combined development environment contains both.
+
+## Reference BFF surface
+
+The BFF exposes only process liveness, Redis-backed readiness, and `GET /auth/login`. Login accepts
+one optional canonical local `return_to`, stores a fixed-lifetime one-time record before redirecting,
+and sends only the authorization-code, client, callback, scope, state, nonce, and PKCE S256 fields
+to the provider. It sets no cookie and enables no CORS.
+
+The client secret, Redis credentials, raw state, nonce, verifier, transaction identifier, and Redis
+key are absent from redirects, errors, metrics, and logs. Callback handling, provider exchange,
+token validation, Identity bootstrap, sessions, CSRF application flows, refresh, and logout remain
+absent and return ordinary not-found problems. See
+[the standalone example](examples/reference_bff/README.md) for its configuration boundary.
 
 This Python runtime SBOM does not inventory operating-system or container-image packages.
 Infrastructure or release automation may later combine it with an independently generated

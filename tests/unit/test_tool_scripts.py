@@ -81,6 +81,14 @@ def test_lock_checker_uses_fixed_interpreter_argv_without_a_shell(
     assert observed["cwd"] == tmp_path
 
 
+def test_lock_checker_covers_identity_bff_and_combined_development_sets() -> None:
+    assert check_locks.LOCKS == (
+        ("requirements.in", "requirements.lock"),
+        ("examples/reference_bff/requirements.in", "examples/reference_bff/requirements.lock"),
+        ("requirements-dev.in", "requirements-dev.lock"),
+    )
+
+
 def test_container_tmpfs_suppression_is_a_fixed_non_user_path() -> None:
     assert container_smoke.CONTAINER_TMPFS == "/tmp"
 

@@ -41,7 +41,7 @@ jobs:
       - name: Verify dependency locks are reproducible
         run: |
           make lock
-          git diff --exit-code -- requirements.lock requirements-dev.lock
+          git diff --exit-code -- requirements.lock requirements-dev.lock examples/reference_bff/requirements.lock
 
       - name: Format, lint, and type-check
         run: |
@@ -49,9 +49,10 @@ jobs:
           make lint
           make typecheck
 
-      - name: Start PostgreSQL 18.4 and migrate
+      - name: Start PostgreSQL 18.4, Redis 8.2.1, and migrate
         run: |
           make db-up
+          make redis-up
           make migrate
 
       - name: Validate migrations
@@ -65,10 +66,16 @@ jobs:
           make test-unit
           make test-contract
           make test-security
+          make test-bff-unit
+          make test-bff-contract
+          make test-bff-security
+          make test-bff-redis
           make test-integration
 
       - name: Enforce branch coverage
-        run: make coverage
+        run: |
+          make coverage
+          make coverage-bff
 
       - name: Check deterministic OpenAPI
         run: make openapi-check
@@ -83,10 +90,14 @@ jobs:
         run: git diff --check
 
       - name: Build production image
-        run: make docker-build
+        run: |
+          make docker-build
+          make docker-build-bff
 
       - name: Smoke-test packed image
-        run: make docker-smoke
+        run: |
+          make docker-smoke
+          make docker-smoke-bff
 
       - name: Stop disposable services
         if: always()

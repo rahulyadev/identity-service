@@ -57,6 +57,26 @@ case-sensitive `sub` must match the verified token. No token, JWK, raw claim doc
 response is persisted. A generated-key HTTP fixture exists only in test code and the packed smoke
 harness; it is absent from the runtime image and forbidden by deployed URL validation.
 
+## Standalone reference BFF
+
+`examples/reference_bff` is an independently packaged asynchronous FastAPI application. It shares
+no import or runtime-dependency edge with `identity_service`. Its only state is a fixed-lifetime,
+versioned OAuth authorization transaction stored in Redis using atomic `SET NX EX` creation and
+`GETDEL` consumption. A SHA-256 digest of state selects the namespaced Redis key; raw state is not a
+key component. Malformed consumed records are not restored.
+
+Each login creates independent state, nonce, transaction ID, and RFC 7636 verifier values using the
+standard-library cryptographic random source. The provider redirect uses only the S256 challenge;
+the verifier and transaction ID stay in the one-time record. The callback URI is derived exactly
+from the configured BFF origin. A strict canonical-local-path rule prevents the optional return
+target from becoming an open redirect.
+
+The BFF process owns and closes one bounded Redis asyncio pool. Liveness never queries that pool;
+readiness does. Redis is disposable and authoritative for no identity or session data. The package
+has a separate runtime lock, CycloneDX inventory, non-root image, and packed-container validation.
+It implements no callback, provider exchange, token verification, profile call, session, cookie,
+refresh, or logout route.
+
 ## Infrastructure boundary
 
 The repository owns application source, schema migrations, tests, a disposable local Compose path,
