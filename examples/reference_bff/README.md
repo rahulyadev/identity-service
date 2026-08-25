@@ -7,13 +7,18 @@ It does not import or run the Identity service.
 The public surface is deliberately small:
 
 - `GET /health/live` checks only the BFF process.
-- `GET /health/ready` checks bounded access to disposable Redis transaction storage.
+- `GET /health/ready` performs a short-lived `SET NX EX` plus `GETDEL` capability probe under a
+  dedicated readiness namespace and leaves no key after success.
 - `GET /auth/login` validates an optional local `return_to`, persists a one-time transaction, and
   returns a temporary provider redirect using state, nonce, and PKCE S256.
 
 Callback handling, code exchange, token validation, profile bootstrap, application sessions,
 cookies, CSRF-protected routes, refresh, and logout are intentionally absent. Redis loss restarts a
 login attempt; Redis never contains durable identity data.
+
+The packed runtime removes Python and operating-system package-manager tooling after its locked
+dependencies are installed. Packed-image validation proves that boundary along with non-root,
+read-only, capability-dropped operation.
 
 ## Configuration boundary
 

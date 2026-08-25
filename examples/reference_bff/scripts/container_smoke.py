@@ -104,17 +104,18 @@ def main() -> int:
                 "python",
                 "-c",
                 "import importlib.util,json,os,shutil;"
-                "names=('pip','pip3','gcc','cc','make','git','aws','gcloud','terraform','tofu');"
+                "modules=('pip','ensurepip','pytest','identity_service');"
+                "names=('pip','pip3','apt','apt-get','apt-cache','dpkg','dpkg-query','dpkg-deb',"
+                "'apk','yum','dnf','microdnf','rpm','npm','npx','gem','gcc','cc','make','git',"
+                "'aws','gcloud','terraform','tofu');"
                 "print(json.dumps({'uid':os.getuid(),'gid':os.getgid(),"
-                "'pip_module':importlib.util.find_spec('pip') is not None,"
-                "'pytest_module':importlib.util.find_spec('pytest') is not None,"
-                "'identity_module':importlib.util.find_spec('identity_service') is not None,"
+                "'modules':{name:importlib.util.find_spec(name) is not None for name in modules},"
                 "'paths':{name:shutil.which(name) for name in names}},sort_keys=True))",
             )
         )
         if tooling["uid"] != 10002 or tooling["gid"] != 10002:
             raise RuntimeError("packed BFF process is not the documented non-root identity")
-        if tooling["pip_module"] or tooling["pytest_module"] or tooling["identity_module"]:
+        if any(tooling["modules"].values()):
             raise RuntimeError("packed BFF contains a forbidden package boundary")
         if any(tooling["paths"].values()):
             raise RuntimeError("packed BFF contains development or deployment tooling")
@@ -171,6 +172,7 @@ def main() -> int:
             "reference BFF packed image passed: "
             f"image={image['Id']} redis={redis_digests[0]} uid_gid=10002:10002 "
             "read_only=true cap_drop=ALL no_new_privileges=true dependency_isolation=true "
+            "package_managers_absent=true "
             "redis_outage_live=true readiness_recovered=true no_cookie=true no_cors=true "
             f"shutdown_seconds={shutdown_seconds:.3f}"
         )

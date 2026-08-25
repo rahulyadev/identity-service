@@ -6,8 +6,9 @@ from collections.abc import AsyncIterator, Callable
 
 import pytest
 from redis.asyncio import Redis
+from redis.exceptions import ResponseError as RedisResponseError
 from reference_bff.config import Settings
-from reference_bff.store import RedisTransactionStore
+from reference_bff.store import READINESS_TTL_SECONDS, RedisTransactionStore
 from reference_bff.transactions import MalformedTransactionError
 
 
@@ -37,6 +38,21 @@ async def _with_store(
 def redis_settings(bff_settings_factory: Callable[..., Settings], *, namespace: str) -> Settings:
     url = os.environ["BFF_TEST_REDIS_URL"]
     return bff_settings_factory(redis_url=url, redis_key_namespace=namespace)
+
+
+class GetdelDeniedClient:
+    def __init__(self, client: Redis) -> None:
+        self._client = client
+
+    async def set(self, name: str, value: bytes, *, nx: bool, ex: int) -> bool | None:
+        result = await self._client.set(name, value, nx=nx, ex=ex)
+        return True if result is True else None
+
+    async def getdel(self, name: str) -> bytes | None:
+        raise RedisResponseError("synthetic GETDEL denial")
+
+    async def aclose(self) -> None:
+        return
 
 
 @pytest.mark.redis_integration
@@ -115,7 +131,74 @@ def test_readiness_fails_closed_for_unavailable_redis_and_recovers_on_real_store
             assert await failed_store.ready() is False
         finally:
             await failed_store.close()
-        async for store, _client in _with_store(settings):
+        async for store, client in _with_store(settings):
             assert await store.ready() is True
+            readiness_keys = [
+                key
+                async for key in client.scan_iter(
+                    match=f"{settings.redis_key_namespace}:readiness:*"
+                )
+            ]
+            assert readiness_keys == []
+
+    run(scenario())
+
+
+@pytest.mark.redis_integration
+def test_concurrent_real_redis_readiness_probes_do_not_collide_or_leak(
+    bff_settings_factory: Callable[..., Settings],
+) -> None:
+    settings = redis_settings(
+        bff_settings_factory, namespace="reference-bff:test:redis-readiness-concurrency"
+    )
+
+    async def scenario() -> None:
+        async for store, client in _with_store(settings):
+            assert await asyncio.gather(*(store.ready() for _ in range(50))) == [True] * 50
+            readiness_keys = [
+                key
+                async for key in client.scan_iter(
+                    match=f"{settings.redis_key_namespace}:readiness:*"
+                )
+            ]
+            assert readiness_keys == []
+
+    run(scenario())
+
+
+@pytest.mark.redis_integration
+def test_failed_getdel_probe_is_bounded_by_short_real_redis_expiry(
+    bff_settings_factory: Callable[..., Settings],
+) -> None:
+    settings = redis_settings(
+        bff_settings_factory, namespace="reference-bff:test:redis-readiness-expiry"
+    )
+
+    async def scenario() -> None:
+        client = Redis.from_url(settings.redis_url.get_secret_value(), decode_responses=False)
+        await _delete_namespace(client, settings.redis_key_namespace)
+        store = RedisTransactionStore(settings, GetdelDeniedClient(client))
+        try:
+            assert await client.ping() is True
+            assert await store.ready() is False
+            readiness_keys = [
+                key
+                async for key in client.scan_iter(
+                    match=f"{settings.redis_key_namespace}:readiness:*"
+                )
+            ]
+            assert len(readiness_keys) == 1
+            ttl = await client.ttl(readiness_keys[0])
+            assert 0 < ttl <= READINESS_TTL_SECONDS <= 5
+            await asyncio.sleep(READINESS_TTL_SECONDS + 0.2)
+            assert [
+                key
+                async for key in client.scan_iter(
+                    match=f"{settings.redis_key_namespace}:readiness:*"
+                )
+            ] == []
+        finally:
+            await _delete_namespace(client, settings.redis_key_namespace)
+            await client.aclose()
 
     run(scenario())

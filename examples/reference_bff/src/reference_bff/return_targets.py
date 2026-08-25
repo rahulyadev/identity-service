@@ -25,7 +25,7 @@ def canonical_local_return_target(value: str, *, max_bytes: int = 2048) -> str:
         or value.startswith("//")
         or "\\" in value
         or "%" in value
-        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+        or any(unicodedata.category(character) in {"Cc", "Cf"} for character in value)
     ):
         raise InvalidReturnTargetError("invalid return target")
     parsed = urlsplit(value)

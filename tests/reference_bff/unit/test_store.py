@@ -9,6 +9,7 @@ import pytest
 from redis.exceptions import ConnectionError as RedisConnectionError
 from reference_bff.config import Settings
 from reference_bff.store import (
+    READINESS_TTL_SECONDS,
     RedisTransactionStore,
     TransactionCollisionError,
     TransactionStoreUnavailableError,
@@ -23,6 +24,9 @@ class FakeRedis:
         self.set_calls: list[tuple[str, bytes, bool, int]] = []
         self.getdel_calls: list[str] = []
         self.raise_errors = False
+        self.deny_getdel = False
+        self.missing_getdel_value = False
+        self.wrong_getdel_value = False
         self.closed = False
 
     async def set(self, name: str, value: bytes, *, nx: bool, ex: int) -> bool | None:
@@ -35,10 +39,13 @@ class FakeRedis:
         return result
 
     async def getdel(self, name: str) -> bytes | None:
-        if self.raise_errors:
+        if self.raise_errors or self.deny_getdel:
             raise RedisConnectionError("synthetic outage")
         self.getdel_calls.append(name)
-        return self.values.pop(name, None)
+        value = self.values.pop(name, None)
+        if self.missing_getdel_value:
+            return None
+        return b"wrong-marker" if self.wrong_getdel_value and value is not None else value
 
     async def ping(self) -> bool:
         if self.raise_errors:
@@ -174,6 +181,55 @@ def test_outage_fails_closed_for_create_consume_and_readiness(
     with pytest.raises(TransactionStoreUnavailableError):
         run(store.consume("A" * 43))
     assert run(store.ready()) is False
+
+
+def test_readiness_uses_unique_dedicated_set_nx_ex_getdel_probe(
+    bff_settings_factory: Callable[..., Settings],
+) -> None:
+    redis = FakeRedis()
+    store = RedisTransactionStore(bff_settings_factory(), redis)
+
+    assert run(store.ready()) is True
+    assert run(store.ready()) is True
+
+    assert len(redis.set_calls) == 2
+    assert len(redis.getdel_calls) == 2
+    assert {call[0] for call in redis.set_calls} == set(redis.getdel_calls)
+    assert len({call[0] for call in redis.set_calls}) == 2
+    assert all(":readiness:" in call[0] for call in redis.set_calls)
+    assert all(":oauth-transaction:" not in call[0] for call in redis.set_calls)
+    assert all(call[2] is True and call[3] == READINESS_TTL_SECONDS for call in redis.set_calls)
+    assert redis.values == {}
+
+
+def test_ping_success_does_not_mask_denied_set_or_getdel(
+    bff_settings_factory: Callable[..., Settings],
+) -> None:
+    denied_set = FakeRedis()
+    denied_set.set_results = [None]
+    assert run(denied_set.ping()) is True
+    assert run(RedisTransactionStore(bff_settings_factory(), denied_set).ready()) is False
+    assert denied_set.getdel_calls == []
+
+    denied_getdel = FakeRedis()
+    denied_getdel.deny_getdel = True
+    assert run(denied_getdel.ping()) is True
+    assert run(RedisTransactionStore(bff_settings_factory(), denied_getdel).ready()) is False
+    assert len(denied_getdel.set_calls) == 1
+    assert denied_getdel.set_calls[0][3] == READINESS_TTL_SECONDS
+
+
+def test_readiness_rejects_missing_or_wrong_consumed_marker(
+    bff_settings_factory: Callable[..., Settings],
+) -> None:
+    missing = FakeRedis()
+    missing.missing_getdel_value = True
+    assert run(RedisTransactionStore(bff_settings_factory(), missing).ready()) is False
+
+    wrong = FakeRedis()
+    wrong.wrong_getdel_value = True
+    assert run(RedisTransactionStore(bff_settings_factory(), wrong).ready()) is False
+    assert wrong.values == {}
 
 
 def test_invalid_state_never_reaches_redis_and_pool_closes(

@@ -49,6 +49,18 @@ def test_return_target_rejects_open_redirect_and_noncanonical_attacks(target: st
         canonical_local_return_target(target)
 
 
+@pytest.mark.parametrize("character", ["\u0085", "\u009f", "\u200b", "\u202e"])
+def test_return_target_rejects_unicode_controls_and_format_characters(
+    character: str,
+) -> None:
+    target = f"/profile{character}settings"
+    with pytest.raises(InvalidReturnTargetError):
+        canonical_local_return_target(target)
+    query = f"return_to={quote(target, safe='')}".encode()
+    with pytest.raises(InvalidReturnTargetError):
+        return_target_from_query(query)
+
+
 @pytest.mark.parametrize(
     "query",
     [

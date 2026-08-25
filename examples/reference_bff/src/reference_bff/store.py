@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac
+import secrets
 import time
 from collections.abc import Callable
 from typing import Protocol, cast
@@ -21,6 +23,7 @@ from reference_bff.transactions import (
 )
 
 MAX_COLLISION_ATTEMPTS = 3
+READINESS_TTL_SECONDS = 2
 
 
 class TransactionStoreUnavailableError(RuntimeError):
@@ -35,8 +38,6 @@ class RedisClient(Protocol):
     async def set(self, name: str, value: bytes, *, nx: bool, ex: int) -> bool | None: ...
 
     async def getdel(self, name: str) -> bytes | None: ...
-
-    async def ping(self) -> bool: ...
 
     async def aclose(self) -> None: ...
 
@@ -82,6 +83,9 @@ class RedisTransactionStore:
             f"{self._settings.redis_key_namespace}\x00{state}".encode()
         ).hexdigest()
         return f"{self._settings.redis_key_namespace}:oauth-transaction:{digest}"
+
+    def _readiness_key(self, probe_id: str) -> str:
+        return f"{self._settings.redis_key_namespace}:readiness:{probe_id}"
 
     async def create(self, return_to: str) -> AuthorizationTransaction:
         for _ in range(MAX_COLLISION_ATTEMPTS):
@@ -129,11 +133,23 @@ class RedisTransactionStore:
         )
 
     async def ready(self) -> bool:
+        probe_id = secrets.token_hex(32)
+        marker = secrets.token_bytes(32)
+        key = self._readiness_key(probe_id)
         try:
             async with asyncio.timeout(self._settings.redis_operation_timeout_seconds):
-                return await self._client.ping() is True
+                created = await self._client.set(
+                    key,
+                    marker,
+                    nx=True,
+                    ex=READINESS_TTL_SECONDS,
+                )
+                if created is not True:
+                    return False
+                consumed = await self._client.getdel(key)
         except RedisError, TimeoutError, OSError:
             return False
+        return type(consumed) is bytes and hmac.compare_digest(consumed, marker)
 
     async def close(self) -> None:
         try:

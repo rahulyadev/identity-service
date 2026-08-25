@@ -19,7 +19,22 @@ ENV VIRTUAL_ENV=/opt/venv \
 
 RUN groupadd --gid 10002 reference-bff \
     && useradd --uid 10002 --gid reference-bff --no-create-home --shell /usr/sbin/nologin reference-bff \
-    && rm -rf /usr/local/lib/python3.14/site-packages/pip* /usr/local/bin/pip*
+    && rm -rf \
+        /usr/local/lib/python3.14/ensurepip \
+        /usr/local/lib/python3.14/site-packages/pip* \
+        /usr/local/bin/pip* \
+        /usr/bin/apt \
+        /usr/bin/apt-* \
+        /usr/lib/apt \
+        /etc/apt \
+        /var/cache/apt \
+        /var/lib/apt \
+        /usr/bin/dpkg \
+        /usr/bin/dpkg-* \
+        /usr/sbin/dpkg-* \
+        /usr/lib/dpkg \
+        /usr/share/dpkg \
+        /var/lib/dpkg
 
 WORKDIR /app
 COPY --from=runtime-dependencies /opt/venv /opt/venv
