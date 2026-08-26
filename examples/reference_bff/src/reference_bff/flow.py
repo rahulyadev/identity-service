@@ -89,6 +89,8 @@ class CallbackFlow:
             subject=verified.subject,
             client_id=verified.client_id,
             user_id=profile.user_id,
+            nonce=transaction.nonce,
+            token_family_id=verified.token_family_id,
             access_token=verified.access_token,
             id_token=verified.id_token,
             refresh_token=verified.refresh_token,

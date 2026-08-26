@@ -32,15 +32,19 @@ class TokenVerificationUnavailableError(RuntimeError):
     """Signing-key verification is temporarily unavailable."""
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, repr=False)
 class VerifiedTokens:
     issuer: str
     subject: str = field(repr=False)
     client_id: str
+    token_family_id: str = field(repr=False)
     access_expires_at: int
     access_token: str = field(repr=False)
     id_token: str = field(repr=False)
     refresh_token: str = field(repr=False)
+
+    def __repr__(self) -> str:
+        return "VerifiedTokens(<redacted>)"
 
 
 class CognitoTokenVerifier:
@@ -60,18 +64,64 @@ class CognitoTokenVerifier:
         refresh_token: str,
         expected_nonce: str,
     ) -> VerifiedTokens:
+        return await self._verify_pair(
+            id_token=id_token,
+            access_token=access_token,
+            refresh_token=refresh_token,
+            expected_nonce=expected_nonce,
+            expected_subject=None,
+            expected_token_family_id=None,
+            refresh_semantics=False,
+        )
+
+    async def verify_refresh(
+        self,
+        *,
+        id_token: str,
+        access_token: str,
+        refresh_token: str,
+        expected_nonce: str,
+        expected_subject: str,
+        expected_token_family_id: str | None,
+    ) -> VerifiedTokens:
+        return await self._verify_pair(
+            id_token=id_token,
+            access_token=access_token,
+            refresh_token=refresh_token,
+            expected_nonce=expected_nonce,
+            expected_subject=expected_subject,
+            expected_token_family_id=expected_token_family_id,
+            refresh_semantics=True,
+        )
+
+    async def _verify_pair(
+        self,
+        *,
+        id_token: str,
+        access_token: str,
+        refresh_token: str,
+        expected_nonce: str,
+        expected_subject: str | None,
+        expected_token_family_id: str | None,
+        refresh_semantics: bool,
+    ) -> VerifiedTokens:
         id_claims = await self._verify_one(
             id_token,
             token_use="id",  # nosec B106
             expected_audience=self._client_id,
+            require_nonce=not refresh_semantics,
         )
         access_claims = await self._verify_one(
             access_token,
             token_use="access",  # nosec B106
             expected_audience=self._resource,
+            require_nonce=False,
         )
         nonce = id_claims.get("nonce")
-        if type(nonce) is not str or not hmac.compare_digest(nonce, expected_nonce):
+        if (not refresh_semantics and type(nonce) is not str) or (
+            nonce is not None
+            and (type(nonce) is not str or not hmac.compare_digest(nonce, expected_nonce))
+        ):
             raise InvalidProviderTokenError("invalid ID token nonce")
         access_client = access_claims.get("client_id")
         if type(access_client) is not str or not hmac.compare_digest(
@@ -85,6 +135,19 @@ class CognitoTokenVerifier:
         access_subject = self._subject(access_claims.get("sub"))
         if not hmac.compare_digest(id_subject, access_subject):
             raise InvalidProviderTokenError("provider token subjects differ")
+        if expected_subject is not None and not hmac.compare_digest(id_subject, expected_subject):
+            raise InvalidProviderTokenError("provider token subject changed")
+        id_family = self._identifier(id_claims.get("origin_jti"))
+        access_family = self._identifier(access_claims.get("origin_jti"))
+        self._identifier(id_claims.get("jti"))
+        self._identifier(access_claims.get("jti"))
+        if not hmac.compare_digest(id_family, access_family):
+            raise InvalidProviderTokenError("provider token family differs")
+        if refresh_semantics and (
+            expected_token_family_id is None
+            or not hmac.compare_digest(id_family, expected_token_family_id)
+        ):
+            raise InvalidProviderTokenError("provider token family changed")
         at_hash = id_claims.get("at_hash")
         if at_hash is not None and (
             type(at_hash) is not str
@@ -106,6 +169,7 @@ class CognitoTokenVerifier:
             issuer=self._issuer,
             subject=id_subject,
             client_id=self._client_id,
+            token_family_id=id_family,
             access_expires_at=expires_at,
             access_token=access_token,
             id_token=id_token,
@@ -118,6 +182,7 @@ class CognitoTokenVerifier:
         *,
         token_use: str,
         expected_audience: str,
+        require_nonce: bool,
     ) -> dict[str, Any]:
         header, unverified_claims = self._strict_documents(raw_token)
         if set(header) - ALLOWED_HEADERS or header.get("alg") != "RS256":
@@ -144,7 +209,8 @@ class CognitoTokenVerifier:
             raise TokenVerificationUnavailableError("token signing keys are unavailable") from None
         required = ["iss", "sub", "aud", "token_use", "exp", "iat", "auth_time"]
         if token_use == "id":  # nosec B105
-            required.append("nonce")
+            if require_nonce:
+                required.append("nonce")
         else:
             required.extend(("client_id", "scope"))
         try:
@@ -238,6 +304,17 @@ class CognitoTokenVerifier:
             or any(ord(character) < 32 or ord(character) == 127 for character in value)
         ):
             raise InvalidProviderTokenError("invalid provider subject")
+        return value
+
+    @staticmethod
+    def _identifier(value: Any) -> str:
+        if (
+            type(value) is not str
+            or not 1 <= len(value) <= 255
+            or not value.isascii()
+            or any(ord(character) < 33 or ord(character) == 127 for character in value)
+        ):
+            raise InvalidProviderTokenError("invalid token-family identifier")
         return value
 
     @staticmethod

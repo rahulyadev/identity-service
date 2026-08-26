@@ -8,6 +8,7 @@ from starlette.responses import JSONResponse
 
 PROBLEM_TITLES = {
     400: "Bad Request",
+    401: "Unauthorized",
     404: "Not Found",
     405: "Method Not Allowed",
     500: "Internal Server Error",

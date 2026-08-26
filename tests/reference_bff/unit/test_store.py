@@ -11,6 +11,8 @@ from redis.exceptions import ConnectionError as RedisConnectionError
 from reference_bff.config import Settings
 from reference_bff.sessions import SessionRecord
 from reference_bff.store import (
+    CAS_SESSION_SCRIPT,
+    DELETE_IF_EQUAL_SCRIPT,
     READINESS_TTL_SECONDS,
     RedisTransactionStore,
     TransactionCollisionError,
@@ -38,7 +40,12 @@ class FakeRedis:
         result = self.set_results.pop(0) if self.set_results else name not in self.values
         if result:
             self.values[name] = value
-        return result
+        return True if result else None
+
+    async def get(self, name: str) -> bytes | None:
+        if self.raise_errors:
+            raise RedisConnectionError("synthetic outage")
+        return self.values.get(name)
 
     async def getdel(self, name: str) -> bytes | None:
         if self.raise_errors or self.deny_getdel:
@@ -48,6 +55,26 @@ class FakeRedis:
         if self.missing_getdel_value:
             return None
         return b"wrong-marker" if self.wrong_getdel_value and value is not None else value
+
+    async def eval(self, script: str, numkeys: int, *keys_and_args: object) -> object:
+        if self.raise_errors:
+            raise RedisConnectionError("synthetic outage")
+        assert numkeys == 1
+        key = str(keys_and_args[0])
+        expected = keys_and_args[1]
+        current = self.values.get(key)
+        if current is None:
+            return 0
+        if current != expected:
+            return -1
+        if script == CAS_SESSION_SCRIPT:
+            replacement = keys_and_args[2]
+            assert isinstance(replacement, bytes)
+            self.values[key] = replacement
+            return 1
+        assert script == DELETE_IF_EQUAL_SCRIPT
+        del self.values[key]
+        return 1
 
     async def ping(self) -> bool:
         if self.raise_errors:
@@ -70,8 +97,10 @@ def session_record(*, now: int = 1_900_000_000) -> SessionRecord:
         subject="synthetic-subject",
         client_id="synthetic-reference-client",
         user_id="1526af3c-c76a-4e01-a507-347205fb3c93",
-        access_token="synthetic-access-token",
-        id_token="synthetic-id-token-value",
+        nonce="A" * 43,
+        token_family_id="synthetic-token-family",
+        access_token="header.payload.signature",
+        id_token="header.payload.signature",
         refresh_token="synthetic-refresh-token",
         access_expires_at=now + 900,
         created_at=now,
@@ -158,9 +187,9 @@ def test_session_uses_independent_opaque_cookie_digest_key_and_bounded_record(
     assert nx is True
     assert expiry == handle.max_age
     document = json.loads(serialized)
-    assert document["version"] == 1
+    assert document["version"] == 2
     assert document["refresh_version"] == 0
-    assert document["access_token"] == "synthetic-access-token"
+    assert document["access_token"] == "header.payload.signature"
     assert len(serialized) <= settings.max_session_bytes
 
 
@@ -194,6 +223,49 @@ def test_session_storage_outage_and_exhausted_lifetime_fail_closed(
     )
     with pytest.raises(TransactionStoreUnavailableError):
         run(available.create_session(expired))
+
+
+def test_session_load_touch_cas_stale_rejection_and_deleted_non_resurrection(
+    bff_settings_factory: Callable[..., Settings],
+) -> None:
+    settings = bff_settings_factory()
+    redis = FakeRedis()
+    store = RedisTransactionStore(settings, redis, clock=lambda: 1_900_000_000.0)
+    handle = run(store.create_session(session_record()))
+    loaded = run(store.load_session(handle.session_id))
+    assert loaded is not None
+    touched_record = replace(loaded.record, last_activity_at=1_900_000_001)
+
+    assert run(store.cas_session(handle.session_id, loaded, touched_record)) is True
+    touched = run(store.load_session(handle.session_id))
+    assert touched is not None
+    assert touched.record.last_activity_at == 1_900_000_001
+    assert run(store.cas_session(handle.session_id, loaded, loaded.record)) is False
+    assert run(store.invalidate_session(handle.session_id, loaded)) is False
+    assert run(store.invalidate_session(handle.session_id, touched)) is True
+    assert run(store.cas_session(handle.session_id, touched, touched.record)) is False
+    assert run(store.load_session(handle.session_id)) is None
+
+
+def test_refresh_lock_is_digest_keyed_versioned_and_owner_only(
+    bff_settings_factory: Callable[..., Settings],
+) -> None:
+    redis = FakeRedis()
+    store = RedisTransactionStore(bff_settings_factory(), redis)
+    session_id = "A" * 43
+    owner = "Q" * 43
+    other = "g" * 43
+
+    assert run(store.acquire_refresh_lock(session_id, 7, owner)) is True
+    key = store.key_for_refresh_lock(session_id, 7)
+    assert session_id not in key
+    assert owner not in key
+    assert key != store.key_for_refresh_lock(session_id, 8)
+    assert run(store.acquire_refresh_lock(session_id, 7, other)) is False
+    assert run(store.release_refresh_lock(session_id, 7, other)) is False
+    assert redis.values[key] == owner.encode()
+    assert run(store.release_refresh_lock(session_id, 7, owner)) is True
+    assert key not in redis.values
 
 
 @pytest.mark.parametrize(
@@ -268,14 +340,14 @@ def test_readiness_uses_unique_dedicated_set_nx_ex_getdel_probe(
     assert run(store.ready()) is True
     assert run(store.ready()) is True
 
-    assert len(redis.set_calls) == 4
-    assert len(redis.getdel_calls) == 4
-    assert {call[0] for call in redis.set_calls} == set(redis.getdel_calls)
-    assert len({call[0] for call in redis.set_calls}) == 4
+    assert len(redis.set_calls) == 8
+    assert len(redis.getdel_calls) == 2
+    assert len({call[0] for call in redis.set_calls}) == 6
     assert all(":readiness:" in call[0] for call in redis.set_calls)
     assert all(":oauth-transaction:" not in call[0] for call in redis.set_calls)
     assert sum(call[0].endswith(":oauth-transaction") for call in redis.set_calls) == 2
-    assert sum(call[0].endswith(":session") for call in redis.set_calls) == 2
+    assert sum(call[0].endswith(":session-cas") for call in redis.set_calls) == 2
+    assert sum(call[0].endswith(":refresh-lock") for call in redis.set_calls) == 4
     assert all(call[2] is True and call[3] == READINESS_TTL_SECONDS for call in redis.set_calls)
     assert redis.values == {}
 

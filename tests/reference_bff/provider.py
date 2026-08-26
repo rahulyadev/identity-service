@@ -33,32 +33,71 @@ class SyntheticProvider:
     subject: str = "synthetic-cognito-subject"
     code: str = "synthetic-authorization-code"
     refresh_token: str = "synthetic-refresh-token-value"
+    rotated_refresh_token: str = "synthetic-rotated-refresh-token-value"
+    token_family_id: str = "synthetic-token-family"
     bootstrap_status: int = 201
     jwks_status: int = 200
     token_status: int = 200
     identity_status: int = 201
+    profile_status: int = 200
     jwks_content_type: str = "application/jwk-set+json"
     token_content_type: str = "application/json"
     identity_content_type: str = "application/json"
+    refresh_status: int = 200
+    refresh_content_type: str = "application/json"
+    identity_etag: str = '"v1"'
     events: list[str] = field(default_factory=list)
     transaction: AuthorizationTransaction | None = None
     access_token: str = field(default="", repr=False)
     id_token: str = field(default="", repr=False)
+    rotated_access_token: str = field(default="", repr=False)
+    rotated_id_token: str = field(default="", repr=False)
     jwks_document: dict[str, Any] | None = None
     token_document: dict[str, Any] | None = None
     identity_document: dict[str, Any] | None = None
+    refresh_document: dict[str, Any] | None = None
+    refresh_requests: int = 0
 
-    def configure(self, transaction: AuthorizationTransaction, *, now: int | None = None) -> None:
+    def configure(
+        self,
+        transaction: AuthorizationTransaction,
+        *,
+        now: int | None = None,
+        access_lifetime: int = 900,
+    ) -> None:
         self.transaction = transaction
         issued_at = int(time.time()) if now is None else now
+        self.access_token, self.id_token = self._token_pair(
+            issued_at=issued_at,
+            lifetime=access_lifetime,
+            nonce=transaction.nonce,
+            token_id="initial-token",
+        )
+        self.rotated_access_token, self.rotated_id_token = self._token_pair(
+            issued_at=issued_at,
+            lifetime=900,
+            nonce=None,
+            token_id="rotated-token",
+        )
+
+    def _token_pair(
+        self,
+        *,
+        issued_at: int,
+        lifetime: int,
+        nonce: str | None,
+        token_id: str,
+    ) -> tuple[str, str]:
         common = {
             "iss": self.settings.cognito_issuer,
             "sub": self.subject,
             "iat": issued_at,
             "auth_time": issued_at - 1,
-            "exp": issued_at + 900,
+            "exp": issued_at + lifetime,
+            "origin_jti": self.token_family_id,
+            "jti": token_id,
         }
-        self.access_token = jwt.encode(
+        access_token = jwt.encode(
             {
                 **common,
                 "aud": self.settings.oauth_resource,
@@ -70,20 +109,23 @@ class SyntheticProvider:
             algorithm="RS256",
             headers={"kid": self.key_id, "typ": "at+jwt"},
         )
-        digest = hashlib.sha256(self.access_token.encode()).digest()[:16]
+        digest = hashlib.sha256(access_token.encode()).digest()[:16]
         at_hash = base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
-        self.id_token = jwt.encode(
-            {
-                **common,
-                "aud": self.settings.client_id,
-                "token_use": "id",
-                "nonce": transaction.nonce,
-                "at_hash": at_hash,
-            },
+        id_claims = {
+            **common,
+            "aud": self.settings.client_id,
+            "token_use": "id",
+            "at_hash": at_hash,
+        }
+        if nonce is not None:
+            id_claims["nonce"] = nonce
+        id_token = jwt.encode(
+            id_claims,
             self.private_key,
             algorithm="RS256",
             headers={"kid": self.key_id, "typ": "JWT"},
         )
+        return access_token, id_token
 
     def public_jwk(self) -> dict[str, Any]:
         numbers = self.private_key.public_key().public_numbers()
@@ -111,7 +153,6 @@ class SyntheticProvider:
                 content=json.dumps(document).encode(),
             )
         if str(request.url) == self.settings.token_endpoint and request.method == "POST":
-            self.events.append("token")
             if self.transaction is None:
                 raise AssertionError("synthetic provider transaction is not configured")
             expected_basic = base64.b64encode(
@@ -120,6 +161,33 @@ class SyntheticProvider:
                 ).encode()
             ).decode()
             form = parse_qs(request.content.decode(), strict_parsing=True)
+            if form.get("grant_type") == ["refresh_token"]:
+                self.events.append("refresh")
+                self.refresh_requests += 1
+                expected_refresh = {
+                    "grant_type": ["refresh_token"],
+                    "client_id": [self.settings.client_id],
+                    "refresh_token": [self.refresh_token],
+                }
+                if (
+                    request.headers.get("authorization") != f"Basic {expected_basic}"
+                    or form != expected_refresh
+                ):
+                    return httpx2.Response(401, request=request, json={"error": "invalid_grant"})
+                refresh_document = self.refresh_document or {
+                    "access_token": self.rotated_access_token,
+                    "id_token": self.rotated_id_token,
+                    "refresh_token": self.rotated_refresh_token,
+                    "token_type": "Bearer",
+                    "expires_in": 900,
+                }
+                return httpx2.Response(
+                    self.refresh_status,
+                    request=request,
+                    headers={"Content-Type": self.refresh_content_type},
+                    content=json.dumps(refresh_document).encode(),
+                )
+            self.events.append("token")
             expected_form = {
                 "grant_type": ["authorization_code"],
                 "client_id": [self.settings.client_id],
@@ -170,6 +238,40 @@ class SyntheticProvider:
                 self.identity_status,
                 request=request,
                 headers={"Content-Type": self.identity_content_type},
+                content=json.dumps(document).encode(),
+            )
+        if (
+            str(request.url) == self.settings.identity_api_origin + "/v1/me"
+            and request.method == "GET"
+        ):
+            self.events.append("profile")
+            accepted_tokens = {self.access_token, self.rotated_access_token}
+            if (
+                request.content
+                or request.headers.get("authorization", "").removeprefix("Bearer ")
+                not in accepted_tokens
+                or "cookie" in request.headers
+                or request.headers.get("accept") != "application/json"
+            ):
+                return httpx2.Response(400, request=request, json={"error": "invalid_request"})
+            now = "2026-08-25T00:00:00+00:00"
+            document = self.identity_document or {
+                "user_id": "1526af3c-c76a-4e01-a507-347205fb3c93",
+                "email": "synthetic@example.invalid",
+                "email_verified": True,
+                "display_name": None,
+                "avatar_url": None,
+                "version": 1,
+                "created_at": now,
+                "updated_at": now,
+            }
+            return httpx2.Response(
+                self.profile_status,
+                request=request,
+                headers={
+                    "Content-Type": self.identity_content_type,
+                    "ETag": self.identity_etag,
+                },
                 content=json.dumps(document).encode(),
             )
         return httpx2.Response(404, request=request, json={"error": "not_found"})

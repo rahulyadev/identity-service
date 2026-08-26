@@ -7,13 +7,13 @@ operational endpoints, migrations, observability, local containers, and automate
 
 The separately packaged `examples/reference_bff` application demonstrates browser login,
 confidential callback exchange, independent Cognito token validation, Identity bootstrap, and an
-opaque Redis-backed host session. It is not an Identity service import or runtime dependency, and
-it listens independently on local port 8081.
+opaque Redis-backed host session with demand-driven refresh and exact profile reads. It is not an
+Identity service import or runtime dependency, and it listens independently on local port 8081.
 
 The Identity service itself does not provide Google token validation or browser sessions. Its
 Bearer-authenticated profile API remains server-to-server; the reference BFF owns the browser
-callback and cookie boundary. Refresh, CSRF-protected application routes, logout, and real-provider
-integration remain outside the current reference slice.
+callback and cookie boundary. Unsafe application methods, public refresh, CSRF, logout, and
+real-provider integration remain outside the current reference slice.
 
 ## Current contract
 
@@ -133,15 +133,23 @@ merely because the combined development environment contains both.
 
 ## Reference BFF surface
 
-The BFF exposes process liveness, Redis/JWKS-backed readiness, `GET /auth/login`, and
-`GET /auth/callback`. Login accepts one optional canonical local `return_to`, stores a fixed-lifetime
-one-time record before redirecting, and includes the exact Identity resource plus scope, state,
-nonce, and PKCE S256 bindings. The independent transaction ID remains in the bounded server-side
-record and appears in the browser only as a short-lived opaque `__Host-oauth` binding.
+The BFF exposes process liveness, Redis/JWKS-backed readiness, `GET /auth/login`,
+`GET /auth/callback`, and cookie-authenticated `GET /api/me`. Login accepts one optional canonical
+local `return_to`, stores a fixed-lifetime one-time record before redirecting, and includes the
+exact Identity resource plus scope, state, nonce, and PKCE S256 bindings. The independent
+transaction ID remains in the bounded server-side record and appears in the browser only as a
+short-lived opaque `__Host-oauth` binding.
 Callback strictly consumes that record, requires a constant-time match to the initiating browser
 before denial or exchange, validates both Cognito tokens, completes `PUT /v1/me`, stores a
 versioned expiring Redis session, clears the binding, sets one opaque host-only `__Host-session`
 cookie, and redirects locally with `303`.
+
+The profile read rejects query strings, bodies, browser bearer tokens, and ambiguous raw Cookie
+fields. It atomically touches the idle TTL without extending the absolute lifetime, rotates a
+complete Cognito token set at the refresh boundary through a Redis-backed per-version single
+flight, and calls only Identity `GET /v1/me` with the server-held access token. A success contains
+only the validated eight-field profile, matching strong ETag, security headers, and the renewed
+unchanged session ID. Fixed 401/503 failures never disclose upstream bodies or session material.
 
 OAuth transport necessarily carries state and nonce only on the provider authorization request and
 code/state or error/state only on the callback request. None of the transaction ID, state, nonce,
@@ -149,9 +157,9 @@ code, or error values propagate into the final local redirect, response body, se
 browser or application storage, logs, exceptions, representations, metrics, or review evidence.
 The client secret, Redis credentials, verifier, provider subjects, OAuth tokens, provider bodies,
 and session records remain outside every public surface.
-The login/callback binding is not a substitute for CSRF protection on future unsafe
-cookie-authenticated methods. Those methods, application/session routes, CSRF, refresh, logout,
-revocation, `/auth/signed-out`, real provider access, and deployment remain absent. See
+Neither the login/callback binding nor `SameSite=Lax` is a substitute for CSRF protection on future
+unsafe cookie-authenticated methods. Those methods, public refresh/session introspection, CSRF,
+logout, revocation, `/auth/signed-out`, real provider access, and deployment remain absent. See
 [the standalone example](examples/reference_bff/README.md) for its configuration boundary.
 
 This Python runtime SBOM does not inventory operating-system or container-image packages.

@@ -4,14 +4,24 @@ import asyncio
 import os
 import time
 from collections.abc import AsyncIterator, Callable
+from typing import cast
 
+import httpx2
 import pytest
 from redis.asyncio import Redis
 from redis.exceptions import ResponseError as RedisResponseError
 from reference_bff.config import Settings
+from reference_bff.exchange import AuthorizationCodeClient
+from reference_bff.http import AsyncUpstreamClient
+from reference_bff.identity import IdentityProfileClient
+from reference_bff.jwks import AsyncJwksCache
+from reference_bff.session_flow import SessionFlow
 from reference_bff.sessions import SessionRecord
 from reference_bff.store import READINESS_TTL_SECONDS, RedisTransactionStore
-from reference_bff.transactions import MalformedTransactionError
+from reference_bff.tokens import CognitoTokenVerifier
+from reference_bff.transactions import MalformedTransactionError, new_transaction
+
+from tests.reference_bff.provider import SyntheticProvider
 
 
 def run(coroutine: object) -> object:
@@ -37,9 +47,11 @@ async def _with_store(
         await store.close()
 
 
-def redis_settings(bff_settings_factory: Callable[..., Settings], *, namespace: str) -> Settings:
+def redis_settings(
+    bff_settings_factory: Callable[..., Settings], *, namespace: str, **overrides: object
+) -> Settings:
     url = os.environ["BFF_TEST_REDIS_URL"]
-    return bff_settings_factory(redis_url=url, redis_key_namespace=namespace)
+    return bff_settings_factory(redis_url=url, redis_key_namespace=namespace, **overrides)
 
 
 class GetdelDeniedClient:
@@ -52,6 +64,13 @@ class GetdelDeniedClient:
 
     async def getdel(self, name: str) -> bytes | None:
         raise RedisResponseError("synthetic GETDEL denial")
+
+    async def get(self, name: str) -> bytes | None:
+        value = await self._client.get(name)
+        return value if isinstance(value, bytes) else None
+
+    async def eval(self, script: str, numkeys: int, *keys_and_args: object) -> object:
+        return await self._client.eval(script, numkeys, *keys_and_args)
 
     async def aclose(self) -> None:
         return
@@ -112,8 +131,10 @@ def test_real_redis_session_uses_digest_key_fixed_ttl_and_server_only_record(
                 subject="synthetic-subject",
                 client_id=settings.client_id,
                 user_id="1526af3c-c76a-4e01-a507-347205fb3c93",
-                access_token="synthetic-access-token",
-                id_token="synthetic-id-token-value",
+                nonce="A" * 43,
+                token_family_id="synthetic-token-family",
+                access_token="header.payload.signature",
+                id_token="header.payload.signature",
                 refresh_token="synthetic-refresh-token",
                 access_expires_at=now + 900,
                 created_at=now,
@@ -237,5 +258,88 @@ def test_failed_getdel_probe_is_bounded_by_short_real_redis_expiry(
         finally:
             await _delete_namespace(client, settings.redis_key_namespace)
             await client.aclose()
+
+    run(scenario())
+
+
+@pytest.mark.redis_integration
+def test_fifty_real_redis_profile_reads_have_one_refresh_one_version_and_no_stale_overwrite(
+    bff_settings_factory: Callable[..., Settings],
+) -> None:
+    settings = redis_settings(
+        bff_settings_factory,
+        namespace="reference-bff:test:redis-refresh-single-flight",
+        refresh_wait_timeout_ms=2000,
+        refresh_poll_interval_ms=10,
+    )
+
+    async def scenario() -> None:
+        async for store, client in _with_store(settings):
+            now = int(time.time())
+            transaction = new_transaction(
+                return_to="/",
+                callback_uri=settings.callback_uri,
+                ttl_seconds=settings.oauth_transaction_ttl_seconds,
+                now=now,
+            )
+            provider = SyntheticProvider(settings)
+            provider.configure(
+                transaction,
+                now=now,
+                access_lifetime=settings.session_refresh_window_seconds,
+            )
+            initial = SessionRecord(
+                issuer=settings.cognito_issuer,
+                subject=provider.subject,
+                client_id=settings.client_id,
+                user_id="1526af3c-c76a-4e01-a507-347205fb3c93",
+                nonce=transaction.nonce,
+                token_family_id=provider.token_family_id,
+                access_token=provider.access_token,
+                id_token=provider.id_token,
+                refresh_token=provider.refresh_token,
+                access_expires_at=now + settings.session_refresh_window_seconds,
+                created_at=now,
+                last_activity_at=now,
+                absolute_expires_at=now + settings.session_absolute_seconds,
+            )
+            handle = await store.create_session(initial)
+            stale = await store.load_session(handle.session_id)
+            assert stale is not None
+            transport = cast(httpx2.AsyncBaseTransport, httpx2.MockTransport(provider.handle))
+            upstream = AsyncUpstreamClient(settings, transport=transport)
+            jwks = AsyncJwksCache(settings, upstream)
+            flow = SessionFlow(
+                settings=settings,
+                upstream=upstream,
+                jwks=jwks,
+                refresh=AuthorizationCodeClient(settings, upstream),
+                verifier=CognitoTokenVerifier(settings, jwks),
+                identity=IdentityProfileClient(settings, upstream),
+                store=store,
+            )
+            try:
+                results = await asyncio.gather(*(flow.read(handle.session_id) for _ in range(50)))
+                assert len(results) == 50
+                assert all(result.etag == '"v1"' for result in results)
+                assert all(result.profile["version"] == 1 for result in results)
+                assert provider.refresh_requests == 1
+                current = await store.load_session(handle.session_id)
+                assert current is not None
+                assert current.record.refresh_version == 1
+                assert current.record.refresh_token == provider.rotated_refresh_token
+                assert current.record.created_at == initial.created_at
+                assert current.record.absolute_expires_at == initial.absolute_expires_at
+                assert await store.cas_session(handle.session_id, stale, stale.record) is False
+                preserved = await store.load_session(handle.session_id)
+                assert preserved is not None
+                assert preserved.record.refresh_version == 1
+                assert await client.exists(store.key_for_refresh_lock(handle.session_id, 0)) == 0
+                namespace_keys = [
+                    key async for key in client.scan_iter(match=f"{settings.redis_key_namespace}:*")
+                ]
+                assert namespace_keys == [store.key_for_session_id(handle.session_id).encode()]
+            finally:
+                await flow.close()
 
     run(scenario())

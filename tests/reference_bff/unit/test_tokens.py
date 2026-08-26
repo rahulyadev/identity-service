@@ -92,13 +92,80 @@ def test_id_and_access_tokens_validate_independently_with_at_hash(
         assert verified.issuer == settings.cognito_issuer
         assert verified.client_id == settings.client_id
         assert verified.subject == provider.subject
+        assert verified.token_family_id == provider.token_family_id
         assert verified.access_expires_at > int(time.time())
         assert provider.access_token not in repr(verified)
         assert provider.refresh_token not in repr(verified)
+        assert repr(verified) == "VerifiedTokens(<redacted>)"
         await upstream.close()
 
     run(scenario())
     assert provider.events == ["jwks"]
+
+
+def test_refreshed_tokens_validate_independently_with_optional_nonce_and_continuity(
+    bff_settings_factory: Callable[..., Settings],
+) -> None:
+    settings, provider, nonce = configured(bff_settings_factory)
+    upstream, verifier = stack(settings, provider)
+
+    async def scenario() -> None:
+        verified = await verifier.verify_refresh(
+            id_token=provider.rotated_id_token,
+            access_token=provider.rotated_access_token,
+            refresh_token=provider.rotated_refresh_token,
+            expected_nonce=nonce,
+            expected_subject=provider.subject,
+            expected_token_family_id=provider.token_family_id,
+        )
+        assert verified.subject == provider.subject
+        assert verified.token_family_id == provider.token_family_id
+        assert provider.rotated_access_token not in repr(verified)
+        assert provider.rotated_refresh_token not in repr(verified)
+        assert repr(verified) == "VerifiedTokens(<redacted>)"
+        await upstream.close()
+
+    run(scenario())
+
+
+@pytest.mark.parametrize(
+    "mode", ["nonce", "subject", "id-family", "access-family", "missing-family", "scope"]
+)
+def test_refreshed_token_nonce_subject_family_and_scope_discontinuity_fails_closed(
+    bff_settings_factory: Callable[..., Settings], mode: str
+) -> None:
+    settings, provider, nonce = configured(bff_settings_factory)
+    id_token = provider.rotated_id_token
+    access_token = provider.rotated_access_token
+    if mode == "nonce":
+        id_token = resign(id_token, provider.private_key, update={"nonce": "X" * 43})
+    elif mode == "subject":
+        access_token = resign(access_token, provider.private_key, update={"sub": "other-subject"})
+    elif mode == "id-family":
+        id_token = resign(id_token, provider.private_key, update={"origin_jti": "other-family"})
+    elif mode == "access-family":
+        access_token = resign(
+            access_token, provider.private_key, update={"origin_jti": "other-family"}
+        )
+    elif mode == "missing-family":
+        id_token = resign(id_token, provider.private_key, update={"origin_jti": None})
+    else:
+        access_token = resign(access_token, provider.private_key, update={"scope": "openid"})
+    upstream, verifier = stack(settings, provider)
+
+    async def scenario() -> None:
+        with pytest.raises(InvalidProviderTokenError):
+            await verifier.verify_refresh(
+                id_token=id_token,
+                access_token=access_token,
+                refresh_token=provider.rotated_refresh_token,
+                expected_nonce=nonce,
+                expected_subject=provider.subject,
+                expected_token_family_id=provider.token_family_id,
+            )
+        await upstream.close()
+
+    run(scenario())
 
 
 @pytest.mark.parametrize(
@@ -117,6 +184,7 @@ def test_id_and_access_tokens_validate_independently_with_at_hash(
         ("access", {"sub": "different-subject"}),
         ("access", {"scope": "openid identity-service://api/profile.read"}),
         ("access", {"nbf": 4_000_000_000}),
+        ("access", {"jti": None}),
     ],
 )
 def test_wrong_claim_bindings_and_times_fail_closed(
