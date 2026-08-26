@@ -120,6 +120,23 @@ class AuthorizationCodeClient:
             raise InvalidRefreshResponseError("refresh token did not rotate")
         return rotated
 
+    async def revoke(self, refresh_token: str) -> bool:
+        """Make one bounded confidential revocation attempt after local invalidation."""
+
+        try:
+            response = await self._client.request(
+                "POST",
+                self._settings.revocation_endpoint,
+                headers={
+                    "Authorization": f"Basic {self._basic_credential()}",
+                    "Content-Type": "application/x-www-form-urlencoded",
+                },
+                data={"token": refresh_token},
+            )
+        except UpstreamError:
+            return False
+        return response.status_code == 200 and response.body == b""
+
     def _basic_credential(self) -> str:
         return base64.b64encode(
             (

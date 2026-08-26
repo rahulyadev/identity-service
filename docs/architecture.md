@@ -72,10 +72,12 @@ from the configured BFF origin. A strict canonical-local-path rule prevents the 
 target from becoming an open redirect.
 
 The BFF process owns and closes one bounded Redis asyncio pool. Liveness never queries that pool;
-readiness does. Redis is disposable and authoritative for no identity or session data. The package
-has a separate runtime lock, CycloneDX inventory, non-root image, and packed-container validation.
-It implements no callback, provider exchange, token verification, profile call, session, cookie,
-refresh, or logout route.
+readiness does. Redis is disposable, authoritative for the opaque browser session, and
+authoritative for no Identity profile data. Exact compare-and-set replacement coordinates touch
+and refresh; exact compare-and-delete makes logout win permanently over an in-flight refresh CAS.
+After deletion, one bounded confidential Cognito revocation attempt is best effort and cannot
+change the deterministic browser redirect. The package has a separate runtime lock, CycloneDX
+inventory, non-root image, and packed-container validation.
 
 ## Infrastructure boundary
 

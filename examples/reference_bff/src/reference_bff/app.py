@@ -29,6 +29,7 @@ from reference_bff.http import AsyncUpstreamClient
 from reference_bff.identity import IdentityBootstrapClient, IdentityProfileClient
 from reference_bff.jwks import AsyncJwksCache
 from reference_bff.logging import configure_logging
+from reference_bff.logout import RawLogoutRequest
 from reference_bff.middleware import SecurityBoundaryMiddleware, get_request_id
 from reference_bff.problems import PublicProblemError, problem_response
 from reference_bff.profile_updates import MAX_PROFILE_PATCH_BYTES, RawProfilePatch
@@ -108,6 +109,10 @@ class _InjectedCallbackSessionReader:
         del session_id, raw
         raise SessionReadError(503, "session_unavailable", False)
 
+    async def logout(self, session_id: str, raw: RawLogoutRequest) -> None:
+        del session_id, raw
+        raise SessionReadError(503, "session_unavailable", True)
+
     async def ready(self) -> bool:
         return True
 
@@ -148,6 +153,29 @@ async def _raw_profile_patch(request: Request) -> RawProfilePatch:
         body_complete=complete,
         body_oversized=oversized,
     )
+
+
+async def _raw_logout_request(request: Request) -> RawLogoutRequest:
+    body_present = False
+    complete = True
+    try:
+        async for chunk in request.stream():
+            if chunk:
+                body_present = True
+                break
+    except ClientDisconnect:
+        complete = False
+    return RawLogoutRequest(
+        headers=tuple(request.scope.get("headers", [])),
+        query_string=request.scope.get("query_string", b""),
+        body_present=body_present,
+        body_complete=complete,
+    )
+
+
+def _clear_bff_cookies(response: Response) -> None:
+    _clear_oauth_binding_cookie(response)
+    _clear_session_cookie(response)
 
 
 def create_app(
@@ -379,6 +407,36 @@ def create_app(
             headers={"ETag": result.etag, "X-CSRF-Token": result.csrf_token},
         )
         _set_session_cookie(response, session_id, max_age=result.max_age)
+        return response
+
+    @app.post("/auth/logout", include_in_schema=False)
+    async def logout(request: Request) -> Response:
+        try:
+            session_id = parse_session_cookie(list(request.scope.get("headers", [])))
+        except InvalidSessionCookieError:
+            missing_response = problem_response(
+                401, "session_required", get_request_id(request.scope)
+            )
+            _clear_bff_cookies(missing_response)
+            return missing_response
+        raw = await _raw_logout_request(request)
+        profile_reader: SessionReader = request.app.state.session_reader
+        try:
+            await profile_reader.logout(session_id, raw)
+        except SessionReadError as error:
+            failure = problem_response(error.status, error.code, get_request_id(request.scope))
+            if error.clear_cookie:
+                _clear_bff_cookies(failure)
+            return failure
+        response = RedirectResponse(resolved.logout_redirect_uri, status_code=303)
+        _clear_bff_cookies(response)
+        return response
+
+    @app.get("/auth/signed-out", include_in_schema=False)
+    async def signed_out(request: Request) -> Response:
+        await _require_empty_safe_read(request)
+        response = RedirectResponse("/", status_code=303)
+        _clear_bff_cookies(response)
         return response
 
     @app.exception_handler(PublicProblemError)

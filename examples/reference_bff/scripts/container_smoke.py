@@ -72,6 +72,9 @@ class FixtureState:
     identity_rejected: bool = False
     refresh_delay_seconds: float = 0.0
     refresh_requests: int = 0
+    revoke_available: bool = True
+    revoke_requests: int = 0
+    revoke_successes: int = 0
     profile_version: int = 1
     profile_display_name: str | None = None
     patch_requests: int = 0
@@ -197,6 +200,32 @@ def fixture_handler(state: FixtureState) -> type[BaseHTTPRequestHandler]:
             self._json(404, {"error": "not_found"})
 
         def do_POST(self) -> None:
+            if self.path == "/oauth2/revoke":
+                state.events.append("revoke")
+                with state.lock:
+                    state.revoke_requests += 1
+                length = int(self.headers.get("Content-Length", "0"))
+                form = parse_qs(self.rfile.read(length).decode(), strict_parsing=True)
+                expected_basic = base64.b64encode(
+                    f"{FIXTURE_CLIENT_ID}:{FIXTURE_CLIENT_SECRET}".encode()
+                ).decode()
+                if (
+                    self.headers.get("Authorization") != f"Basic {expected_basic}"
+                    or self.headers.get("Content-Type") != "application/x-www-form-urlencoded"
+                    or form != {"token": [state.refresh_token]}
+                    or self.headers.get("Cookie") is not None
+                ):
+                    self._json(401, {"error": "invalid_client"})
+                    return
+                if not state.revoke_available:
+                    self._json(503, {"error": "temporarily_unavailable"})
+                    return
+                with state.lock:
+                    state.revoke_successes += 1
+                self.send_response(200)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
             if self.path != "/oauth2/token":
                 self._json(404, {"error": "not_found"})
                 return
@@ -459,6 +488,34 @@ def assert_session_clear(headers: dict[str, str]) -> None:
         raise RuntimeError("packed BFF session clearing cookie differs")
 
 
+def assert_bff_clear(headers: dict[str, str]) -> None:
+    cookies = set_cookies(headers)
+    if len(cookies) != 2:
+        raise RuntimeError("packed BFF cookie clearing count differs")
+    oauth = next((cookie for cookie in cookies if cookie.startswith('__Host-oauth="";')), "")
+    session = next(
+        (cookie for cookie in cookies if cookie.startswith('__Host-session="";')),
+        "",
+    )
+    assert_binding_clear(oauth)
+    assert_session_clear({"set-cookie": session})
+
+
+def assert_logout_redirect(headers: dict[str, str], fixture_origin: str) -> None:
+    target = urlsplit(headers.get("location", ""))
+    query = parse_qs(target.query, strict_parsing=True)
+    if (
+        f"{target.scheme}://{target.netloc}{target.path}" != f"{fixture_origin}/logout"
+        or query
+        != {
+            "client_id": [FIXTURE_CLIENT_ID],
+            "logout_uri": ["http://localhost:8081/auth/signed-out"],
+        }
+        or set(query) != {"client_id", "logout_uri"}
+    ):
+        raise RuntimeError("packed BFF logout redirect differs")
+
+
 def redis_session(key: str) -> dict[str, Any]:
     raw = run(*COMPOSE, "exec", "-T", "redis", "redis-cli", "--raw", "GET", key)
     document = json.loads(raw)
@@ -544,6 +601,31 @@ def concurrent_profile_patches(
 
     with ThreadPoolExecutor(max_workers=count) as executor:
         return list(executor.map(lambda _index: patch(), range(count)))
+
+
+def concurrent_logouts(
+    session_id: str,
+    csrf_token: str,
+    *,
+    count: int = 50,
+) -> list[tuple[int, dict[str, str], bytes]]:
+    barrier = threading.Barrier(count)
+
+    def logout() -> tuple[int, dict[str, str], bytes]:
+        barrier.wait(timeout=5)
+        return request(
+            "/auth/logout",
+            cookie=f"__Host-session={session_id}",
+            method="POST",
+            headers={
+                "Origin": "http://localhost:8081",
+                "X-CSRF-Token": csrf_token,
+                "Sec-Fetch-Site": "same-origin",
+            },
+        )
+
+    with ThreadPoolExecutor(max_workers=count) as executor:
+        return list(executor.map(lambda _index: logout(), range(count)))
 
 
 def oauth_binding_cookie(headers: dict[str, str]) -> str:
@@ -1226,6 +1308,186 @@ def main() -> int:
         assert_headers(refreshed_headers, allow_cookie=True)
         session_cookie(refreshed_headers, expected_session_id=final_session_id)
 
+        race_record = redis_session(final_session_key)
+        race_csrf = race_record.get("csrf_token")
+        if not isinstance(race_csrf, str):
+            raise RuntimeError("packed BFF race session omitted its CSRF binding")
+        race_record["access_expires_at"] = int(time.time()) + 120
+        race_ttl = int(run(*COMPOSE, "exec", "-T", "redis", "redis-cli", "TTL", final_session_key))
+        replace_redis_session(final_session_key, race_record, race_ttl)
+        refresh_before_race = fixture.refresh_requests
+        revoke_before_race = fixture.revoke_requests
+        revoke_success_before_race = fixture.revoke_successes
+        fixture.refresh_delay_seconds = 0.5
+        fixture.revoke_available = False
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            inflight_profile = executor.submit(
+                request,
+                "/api/me",
+                cookie=f"__Host-session={final_session_id}",
+            )
+            race_deadline = time.monotonic() + 3
+            while fixture.refresh_requests == refresh_before_race:
+                if time.monotonic() >= race_deadline:
+                    raise RuntimeError("packed BFF refresh/logout race did not reach refresh")
+                time.sleep(0.01)
+            race_logout_status, race_logout_headers, race_logout_body = request(
+                "/auth/logout",
+                cookie=f"__Host-session={final_session_id}",
+                method="POST",
+                headers={
+                    "Origin": "http://localhost:8081",
+                    "X-CSRF-Token": race_csrf,
+                    "Sec-Fetch-Site": "same-origin",
+                },
+            )
+            race_profile_status, race_profile_headers, race_profile_body = inflight_profile.result(
+                timeout=5
+            )
+        fixture.refresh_delay_seconds = 0.0
+        if (
+            race_logout_status != 303
+            or race_logout_body
+            or fixture.revoke_requests != revoke_before_race + 1
+            or fixture.revoke_successes != revoke_success_before_race
+            or race_profile_status != 401
+            or json.loads(race_profile_body).get("code") != "session_required"
+            or run(
+                *COMPOSE,
+                "exec",
+                "-T",
+                "redis",
+                "redis-cli",
+                "EXISTS",
+                final_session_key,
+            )
+            != "0"
+        ):
+            raise RuntimeError("packed BFF refresh/logout race resurrected or misreported state")
+        assert_headers(race_logout_headers, allow_cookie=True)
+        assert_logout_redirect(race_logout_headers, fixture_origin)
+        assert_bff_clear(race_logout_headers)
+        assert_headers(race_profile_headers, allow_cookie=True)
+        assert_session_clear(race_profile_headers)
+        if stale_redis_cas(final_session_key, race_record, race_record, race_ttl) != 0:
+            raise RuntimeError("packed BFF stale refresh CAS recreated a logged-out session")
+
+        logout_login_status, logout_login_headers, _logout_login_body = request("/auth/login")
+        if logout_login_status != 307:
+            raise RuntimeError("packed BFF logout-concurrency setup failed")
+        assert_headers(logout_login_headers, allow_cookie=True)
+        logout_binding = oauth_binding_cookie(logout_login_headers)
+        logout_query = parse_qs(urlsplit(logout_login_headers["location"]).query)
+        fixture.expected_nonce = logout_query["nonce"][0]
+        fixture.expected_challenge = logout_query["code_challenge"][0]
+        logout_callback_status, logout_callback_headers, _logout_callback_body = request(
+            f"/auth/callback?code={FIXTURE_CODE}&state={logout_query['state'][0]}",
+            cookie=f"__Host-oauth={logout_binding}",
+        )
+        logout_callback_cookies = set_cookies(logout_callback_headers)
+        if logout_callback_status != 303 or len(logout_callback_cookies) != 2:
+            raise RuntimeError("packed BFF logout-concurrency session setup failed")
+        logout_session_cookie = next(
+            (cookie for cookie in logout_callback_cookies if cookie.startswith("__Host-session=")),
+            "",
+        )
+        logout_session_match = re.fullmatch(
+            r"__Host-session=([A-Za-z0-9_-]{43}); HttpOnly; Max-Age=([0-9]+); "
+            r"Path=/; SameSite=lax; Secure",
+            logout_session_cookie,
+        )
+        if logout_session_match is None:
+            raise RuntimeError("packed BFF logout-concurrency cookie differs")
+        logout_session_id = logout_session_match.group(1)
+        logout_session_digest = hashlib.sha256(
+            f"reference-bff:local:compose\x00session\x00{logout_session_id}".encode()
+        ).hexdigest()
+        logout_session_key = f"reference-bff:local:compose:session:{logout_session_digest}"
+        logout_record = redis_session(logout_session_key)
+        logout_csrf = logout_record.get("csrf_token")
+        if not isinstance(logout_csrf, str) or logout_csrf == race_csrf:
+            raise RuntimeError("packed BFF independent logout session binding differs")
+
+        cross_events = list(fixture.events)
+        cross_session_status, cross_session_headers, cross_session_body = request(
+            "/auth/logout",
+            cookie=f"__Host-session={logout_session_id}",
+            method="POST",
+            headers={
+                "Origin": "http://localhost:8081",
+                "X-CSRF-Token": race_csrf,
+                "Sec-Fetch-Site": "same-origin",
+            },
+        )
+        if (
+            cross_session_status != 403
+            or json.loads(cross_session_body).get("code") != "csrf_failed"
+            or "set-cookie" in cross_session_headers
+            or fixture.events != cross_events
+            or redis_session(logout_session_key) != logout_record
+        ):
+            raise RuntimeError("packed BFF accepted cross-session logout CSRF")
+        assert_headers(cross_session_headers)
+
+        fixture.revoke_available = True
+        revoke_before_concurrency = fixture.revoke_requests
+        success_before_concurrency = fixture.revoke_successes
+        logout_results = concurrent_logouts(logout_session_id, logout_csrf)
+        logout_successes = [result for result in logout_results if result[0] == 303]
+        logout_replays = [result for result in logout_results if result[0] == 401]
+        if (
+            len(logout_successes) != 1
+            or len(logout_replays) != 49
+            or fixture.revoke_requests != revoke_before_concurrency + 1
+            or fixture.revoke_successes != success_before_concurrency + 1
+            or run(
+                *COMPOSE,
+                "exec",
+                "-T",
+                "redis",
+                "redis-cli",
+                "EXISTS",
+                logout_session_key,
+            )
+            != "0"
+        ):
+            summary = Counter(
+                (status, json.loads(body).get("code") if body else None)
+                for status, _headers, body in logout_results
+            )
+            raise RuntimeError(f"packed BFF concurrent logout result differs: {summary}")
+        success_status, success_headers, success_body = logout_successes[0]
+        if success_status != 303 or success_body:
+            raise RuntimeError("packed BFF logout success representation differs")
+        assert_headers(success_headers, allow_cookie=True)
+        assert_logout_redirect(success_headers, fixture_origin)
+        assert_bff_clear(success_headers)
+        for replay_status, replay_headers, replay_body in logout_replays:
+            if (
+                replay_status != 401
+                or json.loads(replay_body).get("code") != "session_required"
+                or "location" in replay_headers
+                or logout_csrf.encode() in replay_body
+            ):
+                raise RuntimeError("packed BFF concurrent logout replay differs")
+            assert_headers(replay_headers, allow_cookie=True)
+            assert_bff_clear(replay_headers)
+
+        events_before_signed_out = list(fixture.events)
+        signed_out_status, signed_out_headers, signed_out_body = request(
+            "/auth/signed-out",
+            cookie=(f"__Host-oauth={logout_binding}; __Host-session={logout_session_id}"),
+        )
+        if (
+            signed_out_status != 303
+            or signed_out_headers.get("location") != "/"
+            or signed_out_body
+            or fixture.events != events_before_signed_out
+        ):
+            raise RuntimeError("packed BFF signed-out route crossed an upstream boundary")
+        assert_headers(signed_out_headers, allow_cookie=True)
+        assert_bff_clear(signed_out_headers)
+
         run(*COMPOSE, "stop", "-t", "10", "redis")
         wait_for("/health/live", 200)
         wait_for("/health/ready", 503)
@@ -1246,6 +1508,26 @@ def main() -> int:
         ):
             raise RuntimeError("packed BFF Redis outage cleared or accepted a valid session")
         assert_headers(redis_profile_headers)
+        revoke_before_redis_outage = fixture.revoke_requests
+        redis_logout_status, redis_logout_headers, redis_logout_body = request(
+            "/auth/logout",
+            cookie=f"__Host-session={logout_session_id}",
+            method="POST",
+            headers={
+                "Origin": "http://localhost:8081",
+                "X-CSRF-Token": logout_csrf,
+                "Sec-Fetch-Site": "same-origin",
+            },
+        )
+        if (
+            redis_logout_status != 503
+            or json.loads(redis_logout_body).get("code") != "session_unavailable"
+            or "location" in redis_logout_headers
+            or fixture.revoke_requests != revoke_before_redis_outage
+        ):
+            raise RuntimeError("packed BFF Redis-outage logout claimed false success")
+        assert_headers(redis_logout_headers, allow_cookie=True)
+        assert_bff_clear(redis_logout_headers)
         run(*COMPOSE, "up", "-d", "--wait", "redis")
         wait_for("/health/ready", 200)
         lost_status, lost_headers, lost_body = request(
@@ -1292,13 +1574,17 @@ def main() -> int:
                 *fixture.issued_values,
                 session_id,
                 final_session_id,
+                logout_session_id,
                 csrf_token,
+                race_csrf,
+                logout_csrf,
                 copied_binding,
                 binding,
                 denied_binding,
                 outage_binding,
                 recovery_binding,
                 final_binding,
+                logout_binding,
                 copied_query["state"][0],
                 copied_query["nonce"][0],
                 query["state"][0],
@@ -1307,6 +1593,8 @@ def main() -> int:
                 outage_query["state"][0],
                 recovery_query["state"][0],
                 final_query["state"][0],
+                logout_query["state"][0],
+                logout_query["nonce"][0],
             )
         ):
             raise RuntimeError("packed BFF logs contain forbidden configuration material")
@@ -1325,6 +1613,10 @@ def main() -> int:
             "profile_patch_outage_recovery=true "
             "refresh_single_flight_50=true refresh_version_once=true rotated_refresh=true "
             "stale_cas_rejected=true no_resurrection=true no_lock_residue=true "
+            "logout_csrf=true logout_cross_session=true logout_concurrency_50=true "
+            "logout_one_delete_revoke=true logout_refresh_race=true "
+            "revocation_outage_recovery=true deterministic_logout_redirect=true "
+            "signed_out_isolated=true logout_redis_outage=true "
             "valid_token_fallback=true expired_token_outage=true exact_invalidation=true "
             "provider_identity_redis_outages=true recovery=true no_cors=true "
             f"shutdown_seconds={shutdown_seconds:.3f}"

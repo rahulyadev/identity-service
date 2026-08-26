@@ -46,6 +46,8 @@ class SyntheticProvider:
     token_content_type: str = "application/json"
     identity_content_type: str = "application/json"
     refresh_status: int = 200
+    revoke_status: int = 200
+    revoke_body: bytes = b""
     refresh_content_type: str = "application/json"
     identity_etag: str = '"v1"'
     profile_version: int = 1
@@ -61,6 +63,8 @@ class SyntheticProvider:
     identity_document: dict[str, Any] | None = None
     refresh_document: dict[str, Any] | None = None
     refresh_requests: int = 0
+    revoke_requests: int = 0
+    revoke_requests_seen: list[dict[str, object]] = field(default_factory=list, repr=False)
     patch_requests: list[dict[str, object]] = field(default_factory=list, repr=False)
     profile_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
@@ -218,6 +222,36 @@ class SyntheticProvider:
                 request=request,
                 headers={"Content-Type": self.token_content_type},
                 content=json.dumps(document).encode(),
+            )
+        if str(request.url) == self.settings.revocation_endpoint and request.method == "POST":
+            self.events.append("revoke")
+            self.revoke_requests += 1
+            expected_basic = base64.b64encode(
+                (
+                    f"{self.settings.client_id}:{self.settings.client_secret.get_secret_value()}"
+                ).encode()
+            ).decode()
+            form = parse_qs(request.content.decode(), strict_parsing=True)
+            self.revoke_requests_seen.append(
+                {
+                    "authorization": request.headers.get("authorization"),
+                    "content_type": request.headers.get("content-type"),
+                    "form": form,
+                    "cookie": request.headers.get("cookie"),
+                }
+            )
+            if (
+                request.headers.get("authorization") != f"Basic {expected_basic}"
+                or request.headers.get("content-type") != "application/x-www-form-urlencoded"
+                or form != {"token": [self.refresh_token]}
+                or "client_id" in form
+                or request.headers.get("cookie") is not None
+            ):
+                return httpx2.Response(401, request=request, json={"error": "invalid_client"})
+            return httpx2.Response(
+                self.revoke_status,
+                request=request,
+                content=self.revoke_body,
             )
         if (
             str(request.url) == self.settings.identity_api_origin + "/v1/me"

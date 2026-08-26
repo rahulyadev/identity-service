@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from reference_bff.config import Settings
 from reference_bff.flow import CallbackFlowError
+from reference_bff.logout import RawLogoutRequest
 from reference_bff.profile_updates import RawProfilePatch
 from reference_bff.session_flow import SessionReadError, SessionReadResult
 from reference_bff.sessions import SessionHandle, SessionRecord, StoredSession, opaque_session_id
@@ -141,6 +142,7 @@ class FakeSessionReader:
         self.failure: SessionReadError | None = None
         self.calls: list[str] = []
         self.patch_calls: list[tuple[str, RawProfilePatch]] = []
+        self.logout_calls: list[tuple[str, RawLogoutRequest]] = []
         self.available = True
         self.closed = False
 
@@ -155,6 +157,11 @@ class FakeSessionReader:
         if self.failure is not None:
             raise self.failure
         return self.result
+
+    async def logout(self, session_id: str, raw: RawLogoutRequest) -> None:
+        self.logout_calls.append((session_id, raw))
+        if self.failure is not None:
+            raise self.failure
 
     async def ready(self) -> bool:
         return self.available

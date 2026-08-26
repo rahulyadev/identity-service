@@ -29,6 +29,14 @@ def test_settings_are_typed_derived_and_secret_safe(
 
     assert settings.port == 8081
     assert settings.callback_uri == "http://localhost:8081/auth/callback"
+    assert settings.managed_login_origin == "http://127.0.0.1:9000"
+    assert settings.revocation_endpoint == "http://127.0.0.1:9000/oauth2/revoke"
+    assert settings.logout_endpoint == "http://127.0.0.1:9000/logout"
+    assert settings.signed_out_uri == "http://localhost:8081/auth/signed-out"
+    assert settings.logout_redirect_uri == (
+        "http://127.0.0.1:9000/logout?client_id=synthetic-reference-client&"
+        "logout_uri=http%3A%2F%2Flocalhost%3A8081%2Fauth%2Fsigned-out"
+    )
     assert settings.oauth_transaction_ttl_seconds == 300
     assert settings.session_refresh_window_seconds == 120
     assert settings.refresh_lock_lease_seconds == 10
@@ -40,6 +48,8 @@ def test_settings_are_typed_derived_and_secret_safe(
     assert redis_password not in str(settings)
     assert "client_secret" not in settings.safe_summary()
     assert "redis_url" not in settings.safe_summary()
+    assert settings.safe_summary()["signed_out_uri"] == settings.signed_out_uri
+    assert settings.client_id not in str(settings.safe_summary())
 
 
 def test_valid_deployed_settings_require_secure_explicit_boundaries(

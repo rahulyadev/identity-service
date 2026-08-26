@@ -1,7 +1,8 @@
 # Reference BFF
 
 This standalone example completes the browser-facing authorization-code callback through session
-issuance, cookie-authenticated profile reads, and one CSRF-protected conditional profile update. It
+issuance, cookie-authenticated profile reads, one CSRF-protected conditional profile update, and
+CSRF-protected logout. It
 owns short-lived Redis authorization
 transactions, validates Cognito tokens independently, bootstraps and reads the Identity profile,
 rotates refresh tokens behind a per-session Redis single flight, and stores OAuth tokens only in an
@@ -31,6 +32,12 @@ The public surface is deliberately small:
   merge-patch media type, and one bounded duplicate-free `display_name` value. It forwards only a
   newly serialized normalized one-member body, the validated ETag, and the server-held bearer to
   Identity `PATCH /v1/me`.
+- `POST /auth/logout` accepts only an empty, unambiguous request. It loads without touch or refresh,
+  validates exact same-origin session-bound CSRF metadata, and atomically deletes the exact Redis
+  session before one bounded best-effort confidential Cognito revocation request. It always clears
+  both BFF cookies after deletion and returns `303` to the exact managed-login `/logout` URL.
+- `GET /auth/signed-out` accepts only an empty safe read, clears both BFF cookies, and returns
+  `303 /` without Redis or upstream access.
 
 The browser receives no OAuth token, provider identifier, or server-side session record. Successful
 profile requests return only the strict shared profile representation. The cookie is an independent
@@ -43,11 +50,12 @@ preserved exactly across touch, refresh, and CAS. It never appears in a cookie, 
 redirect, ETag, log, exception, metric, or CORS header. Redis loss causes reauthentication; it
 never loses the authoritative Identity profile.
 
-Unsafe application methods other than `PATCH /api/me`, public refresh/session introspection,
-logout, revocation, and `/auth/signed-out` are intentionally absent. Cognito logout and Google
-logout semantics are therefore not implemented by this slice. `SameSite=Lax` and the
-login/callback browser binding are additional controls, not substitutes for the session-bound
-synchronizer token and exact-origin checks on the profile PATCH.
+Unsafe application methods other than `PATCH /api/me` and `POST /auth/logout`, public
+refresh/session introspection, global sign-out, and provider-specific logout are intentionally
+absent. Cognito logout does not log the user out of Google or another social/OIDC provider; a later
+login can reuse that provider session. `SameSite=Lax` and the login/callback browser binding are
+additional controls, not substitutes for the session-bound synchronizer token and exact-origin
+checks on either unsafe route.
 
 Refresh is internal and demand-driven. Outside the refresh window, reads use the current access
 token and atomically touch the idle TTL. At the boundary, a digest-keyed Redis lease with an
@@ -88,7 +96,9 @@ authority. The Identity API is configured as an origin and callback is derived o
 `rediss://`, explicit hosts, restrictive proxy networks, JSON logging, and disabled interactive
 documentation.
 
-The callback URI is derived as `${BFF_ORIGIN}/auth/callback`; it is not independently configurable.
+The callback URI is derived as `${BFF_ORIGIN}/auth/callback`; the signed-out URI is derived as
+`${BFF_ORIGIN}/auth/signed-out`; neither is independently configurable. Revocation and logout
+endpoints are derived from the already validated authorization/token managed-login authority.
 The default transaction lifetime is 300 seconds and may not exceed 600 seconds. Requested scopes
 must include `openid`, `identity-service://api/profile.read`, and
 `identity-service://api/profile.write`; login adds the exact `identity-service://api` resource
@@ -102,7 +112,8 @@ The repository Compose file supplies fixed disposable local credentials and Redi
 disabled. It binds the BFF on loopback port 8081 and Redis on a loopback-only test port. Packed
 validation starts an in-memory synthetic token/JWKS/Identity fixture, exercises success, denial,
 cross-browser rejection, replay, 50-way refresh-boundary concurrency, 20-way conditional profile
-write concurrency, CSRF denial/no-mutation, normalized update and clear, stable session-cookie
-renewal, CAS/non-resurrection/lock cleanup, provider/Identity/Redis outages and recovery, inspects
-the server-side session, and then removes the disposable stack. Production secrets and real
-provider access are not needed.
+write concurrency, 50-way logout concurrency, refresh-versus-logout non-resurrection, CSRF
+denial/no-mutation, normalized update and clear, stable session-cookie renewal,
+CAS/non-resurrection/lock cleanup, provider/Identity/Redis outages and recovery, inspects the
+server-side session, and then removes the disposable stack. Production secrets and real provider
+access are not needed.
