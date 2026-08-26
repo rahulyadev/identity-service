@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -40,12 +41,15 @@ class SyntheticProvider:
     token_status: int = 200
     identity_status: int = 201
     profile_status: int = 200
+    patch_status: int = 200
     jwks_content_type: str = "application/jwk-set+json"
     token_content_type: str = "application/json"
     identity_content_type: str = "application/json"
     refresh_status: int = 200
     refresh_content_type: str = "application/json"
     identity_etag: str = '"v1"'
+    profile_version: int = 1
+    profile_display_name: str | None = None
     events: list[str] = field(default_factory=list)
     transaction: AuthorizationTransaction | None = None
     access_token: str = field(default="", repr=False)
@@ -57,6 +61,8 @@ class SyntheticProvider:
     identity_document: dict[str, Any] | None = None
     refresh_document: dict[str, Any] | None = None
     refresh_requests: int = 0
+    patch_requests: list[dict[str, object]] = field(default_factory=list, repr=False)
+    profile_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def configure(
         self,
@@ -259,9 +265,9 @@ class SyntheticProvider:
                 "user_id": "1526af3c-c76a-4e01-a507-347205fb3c93",
                 "email": "synthetic@example.invalid",
                 "email_verified": True,
-                "display_name": None,
+                "display_name": self.profile_display_name,
                 "avatar_url": None,
-                "version": 1,
+                "version": self.profile_version,
                 "created_at": now,
                 "updated_at": now,
             }
@@ -270,7 +276,94 @@ class SyntheticProvider:
                 request=request,
                 headers={
                     "Content-Type": self.identity_content_type,
-                    "ETag": self.identity_etag,
+                    "ETag": (
+                        self.identity_etag
+                        if self.identity_etag != '"v1"' or self.profile_version == 1
+                        else f'"v{self.profile_version}"'
+                    ),
+                },
+                content=json.dumps(document).encode(),
+            )
+        if (
+            str(request.url) == self.settings.identity_api_origin + "/v1/me"
+            and request.method == "PATCH"
+        ):
+            self.events.append("profile_patch")
+            accepted_tokens = {self.access_token, self.rotated_access_token}
+            forwarded: dict[str, object] = {
+                "authorization": request.headers.get("authorization"),
+                "accept": request.headers.get("accept"),
+                "content-type": request.headers.get("content-type"),
+                "if-match": request.headers.get("if-match"),
+                "cookie": request.headers.get("cookie"),
+                "origin": request.headers.get("origin"),
+                "sec-fetch-site": request.headers.get("sec-fetch-site"),
+                "x-csrf-token": request.headers.get("x-csrf-token"),
+                "x-request-id": request.headers.get("x-request-id"),
+                "body": bytes(request.content),
+            }
+            self.patch_requests.append(forwarded)
+            if (
+                request.headers.get("authorization", "").removeprefix("Bearer ")
+                not in accepted_tokens
+                or request.headers.get("accept") != "application/json"
+                or request.headers.get("content-type") != "application/merge-patch+json"
+                or any(
+                    request.headers.get(name) is not None
+                    for name in (
+                        "cookie",
+                        "origin",
+                        "sec-fetch-site",
+                        "x-csrf-token",
+                        "x-request-id",
+                    )
+                )
+            ):
+                return httpx2.Response(400, request=request, json={"error": "invalid_request"})
+            if self.patch_status != 200:
+                return httpx2.Response(
+                    self.patch_status,
+                    request=request,
+                    headers={"Content-Type": self.identity_content_type},
+                    json={"error": "synthetic_failure"},
+                )
+            try:
+                patch = json.loads(request.content)
+            except json.JSONDecodeError:
+                return httpx2.Response(400, request=request, json={"error": "invalid_request"})
+            if set(patch) != {"display_name"} or not (
+                patch["display_name"] is None or isinstance(patch["display_name"], str)
+            ):
+                return httpx2.Response(400, request=request, json={"error": "invalid_request"})
+            with self.profile_lock:
+                if request.headers.get("if-match") != f'"v{self.profile_version}"':
+                    return httpx2.Response(
+                        412,
+                        request=request,
+                        headers={"Content-Type": "application/problem+json"},
+                        json={"error": "stale"},
+                    )
+                self.profile_display_name = patch["display_name"]
+                self.profile_version += 1
+                version = self.profile_version
+                display_name = self.profile_display_name
+            now = "2026-08-25T00:00:00+00:00"
+            document = self.identity_document or {
+                "user_id": "1526af3c-c76a-4e01-a507-347205fb3c93",
+                "email": "synthetic@example.invalid",
+                "email_verified": True,
+                "display_name": display_name,
+                "avatar_url": None,
+                "version": version,
+                "created_at": now,
+                "updated_at": now,
+            }
+            return httpx2.Response(
+                200,
+                request=request,
+                headers={
+                    "Content-Type": self.identity_content_type,
+                    "ETag": f'"v{version}"',
                 },
                 content=json.dumps(document).encode(),
             )

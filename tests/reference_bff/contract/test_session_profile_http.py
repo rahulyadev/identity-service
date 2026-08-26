@@ -52,6 +52,7 @@ def test_profile_read_returns_exact_validated_body_etag_and_renews_stable_cookie
     assert response.status_code == 200
     assert response.json() == reader.result.profile
     assert response.headers["etag"] == '"v1"'
+    assert response.headers["x-csrf-token"] == reader.result.csrf_token
     assert response.headers["cache-control"] == "no-store"
     assert "access-control-allow-origin" not in response.headers
     assert "www-authenticate" not in response.headers
@@ -60,6 +61,7 @@ def test_profile_read_returns_exact_validated_body_etag_and_renews_stable_cookie
     assert_session_cookie(cookies[0], session_id=session_id, max_age=43_200)
     assert reader.calls == [session_id]
     assert session_id not in response.text
+    assert reader.result.csrf_token not in response.text
 
 
 @pytest.mark.parametrize(
@@ -128,7 +130,6 @@ def test_profile_fixed_failures_clear_only_invalid_sessions(
         ("GET", "/api/me", {"content": b"x"}, 400),
         ("GET", "/api/me", {"headers": {"authorization": "Bearer browser-token"}}, 400),
         ("PUT", "/api/me", {}, 405),
-        ("PATCH", "/api/me", {}, 405),
         ("POST", "/api/me", {}, 405),
         ("DELETE", "/api/me", {}, 405),
         ("GET", "/api/me/", {}, 404),
@@ -153,3 +154,80 @@ def test_profile_request_shape_and_deferred_surfaces_remain_closed(
     assert reader.calls == []
     assert "access-control-allow-origin" not in response.headers
     assert "www-authenticate" not in response.headers
+
+
+def test_profile_patch_route_passes_raw_request_and_returns_header_only_csrf_etag_and_cookie(
+    bff_settings_factory: Callable[..., Settings],
+) -> None:
+    settings = bff_settings_factory()
+    app, reader = app_stack(settings)
+    session_id = opaque_session_id()
+    body = b'{"display_name":"Updated"}'
+    with ASGIClient(app) as client:
+        response = client.request(
+            "PATCH",
+            "/api/me",
+            headers={
+                "cookie": f"__Host-session={session_id}",
+                "origin": settings.bff_origin,
+                "x-csrf-token": reader.result.csrf_token,
+                "sec-fetch-site": "same-origin",
+                "if-match": '"v1"',
+                "content-type": "application/merge-patch+json",
+            },
+            content=body,
+        )
+
+    assert response.status_code == 200
+    assert response.json() == reader.result.profile
+    assert response.headers["etag"] == reader.result.etag
+    assert response.headers["x-csrf-token"] == reader.result.csrf_token
+    assert reader.result.csrf_token not in response.text
+    assert "access-control-allow-origin" not in response.headers
+    assert len(response.headers.get_list("x-csrf-token")) == 1
+    assert len(response.headers.get_list("set-cookie")) == 1
+    assert_session_cookie(response.headers["set-cookie"], session_id=session_id, max_age=43_200)
+    assert len(reader.patch_calls) == 1
+    assert reader.patch_calls[0][0] == session_id
+    raw = reader.patch_calls[0][1]
+    assert raw.body == body
+    assert raw.query_string == b""
+
+
+@pytest.mark.parametrize(
+    ("failure", "clear"),
+    [
+        (SessionReadError(403, "csrf_failed", False), False),
+        (SessionReadError(412, "profile_conflict", False), False),
+        (SessionReadError(503, "identity_unavailable", False), False),
+        (SessionReadError(401, "session_required", True), True),
+    ],
+)
+def test_profile_patch_failures_never_expose_csrf_or_renew_valid_cookie(
+    bff_settings_factory: Callable[..., Settings],
+    failure: SessionReadError,
+    clear: bool,
+) -> None:
+    settings = bff_settings_factory()
+    app, reader = app_stack(settings)
+    reader.failure = failure
+    session_id = opaque_session_id()
+    with ASGIClient(app) as client:
+        response = client.request(
+            "PATCH",
+            "/api/me",
+            headers={
+                "cookie": f"__Host-session={session_id}",
+                "origin": settings.bff_origin,
+                "x-csrf-token": reader.result.csrf_token,
+                "if-match": '"v1"',
+                "content-type": "application/merge-patch+json",
+            },
+            content=b'{"display_name":null}',
+        )
+
+    assert response.status_code == failure.status
+    assert response.json()["code"] == failure.code
+    assert "x-csrf-token" not in response.headers
+    assert reader.result.csrf_token not in response.text
+    assert ("set-cookie" in response.headers) is clear

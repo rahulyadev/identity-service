@@ -15,8 +15,9 @@ from reference_bff.exchange import AuthorizationCodeClient
 from reference_bff.http import AsyncUpstreamClient
 from reference_bff.identity import IdentityProfileClient
 from reference_bff.jwks import AsyncJwksCache
-from reference_bff.session_flow import SessionFlow
-from reference_bff.sessions import SessionRecord
+from reference_bff.profile_updates import RawProfilePatch
+from reference_bff.session_flow import SessionFlow, SessionReadError, SessionReadResult
+from reference_bff.sessions import SessionRecord, opaque_session_id
 from reference_bff.store import READINESS_TTL_SECONDS, RedisTransactionStore
 from reference_bff.tokens import CognitoTokenVerifier
 from reference_bff.transactions import MalformedTransactionError, new_transaction
@@ -133,6 +134,7 @@ def test_real_redis_session_uses_digest_key_fixed_ttl_and_server_only_record(
                 user_id="1526af3c-c76a-4e01-a507-347205fb3c93",
                 nonce="A" * 43,
                 token_family_id="synthetic-token-family",
+                csrf_token=opaque_session_id(),
                 access_token="header.payload.signature",
                 id_token="header.payload.signature",
                 refresh_token="synthetic-refresh-token",
@@ -295,6 +297,7 @@ def test_fifty_real_redis_profile_reads_have_one_refresh_one_version_and_no_stal
                 user_id="1526af3c-c76a-4e01-a507-347205fb3c93",
                 nonce=transaction.nonce,
                 token_family_id=provider.token_family_id,
+                csrf_token=opaque_session_id(),
                 access_token=provider.access_token,
                 id_token=provider.id_token,
                 refresh_token=provider.refresh_token,
@@ -334,6 +337,105 @@ def test_fifty_real_redis_profile_reads_have_one_refresh_one_version_and_no_stal
                 preserved = await store.load_session(handle.session_id)
                 assert preserved is not None
                 assert preserved.record.refresh_version == 1
+                assert await client.exists(store.key_for_refresh_lock(handle.session_id, 0)) == 0
+                namespace_keys = [
+                    key async for key in client.scan_iter(match=f"{settings.redis_key_namespace}:*")
+                ]
+                assert namespace_keys == [store.key_for_session_id(handle.session_id).encode()]
+            finally:
+                await flow.close()
+
+    run(scenario())
+
+
+@pytest.mark.redis_integration
+def test_twenty_real_redis_profile_patches_have_one_success_fixed_conflicts_and_csrf_binding(
+    bff_settings_factory: Callable[..., Settings],
+) -> None:
+    settings = redis_settings(
+        bff_settings_factory,
+        namespace="reference-bff:test:redis-profile-patch-concurrency",
+    )
+
+    async def scenario() -> None:
+        async for store, client in _with_store(settings):
+            now = int(time.time())
+            transaction = new_transaction(
+                return_to="/",
+                callback_uri=settings.callback_uri,
+                ttl_seconds=settings.oauth_transaction_ttl_seconds,
+                now=now,
+            )
+            provider = SyntheticProvider(settings)
+            provider.configure(transaction, now=now, access_lifetime=900)
+            csrf_token = opaque_session_id()
+            initial = SessionRecord(
+                issuer=settings.cognito_issuer,
+                subject=provider.subject,
+                client_id=settings.client_id,
+                user_id="1526af3c-c76a-4e01-a507-347205fb3c93",
+                nonce=transaction.nonce,
+                token_family_id=provider.token_family_id,
+                csrf_token=csrf_token,
+                access_token=provider.access_token,
+                id_token=provider.id_token,
+                refresh_token=provider.refresh_token,
+                access_expires_at=now + 900,
+                created_at=now,
+                last_activity_at=now,
+                absolute_expires_at=now + settings.session_absolute_seconds,
+            )
+            handle = await store.create_session(initial)
+            body = b'{"display_name":"Concurrent"}'
+            raw = RawProfilePatch(
+                headers=(
+                    (b"origin", settings.bff_origin.encode()),
+                    (b"x-csrf-token", csrf_token.encode()),
+                    (b"sec-fetch-site", b"same-origin"),
+                    (b"if-match", b'"v1"'),
+                    (b"content-type", b"application/merge-patch+json"),
+                    (b"content-length", str(len(body)).encode()),
+                ),
+                query_string=b"",
+                body=body,
+                body_complete=True,
+                body_oversized=False,
+            )
+            transport = cast(httpx2.AsyncBaseTransport, httpx2.MockTransport(provider.handle))
+            upstream = AsyncUpstreamClient(settings, transport=transport)
+            jwks = AsyncJwksCache(settings, upstream)
+            flow = SessionFlow(
+                settings=settings,
+                upstream=upstream,
+                jwks=jwks,
+                refresh=AuthorizationCodeClient(settings, upstream),
+                verifier=CognitoTokenVerifier(settings, jwks),
+                identity=IdentityProfileClient(settings, upstream),
+                store=store,
+            )
+            try:
+                results = await asyncio.gather(
+                    *(flow.patch(handle.session_id, raw) for _ in range(20)),
+                    return_exceptions=True,
+                )
+                successes = [result for result in results if isinstance(result, SessionReadResult)]
+                conflicts = [result for result in results if isinstance(result, SessionReadError)]
+                assert len(successes) + len(conflicts) == len(results)
+                assert len(successes) == 1
+                assert successes[0].etag == '"v2"'
+                assert successes[0].csrf_token == csrf_token
+                assert len(conflicts) == 19
+                assert all(
+                    (error.status, error.code, error.clear_cookie)
+                    == (412, "profile_conflict", False)
+                    for error in conflicts
+                )
+                assert provider.events == ["profile_patch"] * 20
+                assert provider.refresh_requests == 0
+                current = await store.load_session(handle.session_id)
+                assert current is not None
+                assert current.record.csrf_token == csrf_token
+                assert current.record.refresh_version == 0
                 assert await client.exists(store.key_for_refresh_lock(handle.session_id, 0)) == 0
                 namespace_keys = [
                     key async for key in client.scan_iter(match=f"{settings.redis_key_namespace}:*")

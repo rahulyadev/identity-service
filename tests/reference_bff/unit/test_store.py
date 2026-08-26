@@ -9,7 +9,7 @@ from typing import Any
 import pytest
 from redis.exceptions import ConnectionError as RedisConnectionError
 from reference_bff.config import Settings
-from reference_bff.sessions import SessionRecord
+from reference_bff.sessions import SessionRecord, opaque_session_id
 from reference_bff.store import (
     CAS_SESSION_SCRIPT,
     DELETE_IF_EQUAL_SCRIPT,
@@ -99,6 +99,7 @@ def session_record(*, now: int = 1_900_000_000) -> SessionRecord:
         user_id="1526af3c-c76a-4e01-a507-347205fb3c93",
         nonce="A" * 43,
         token_family_id="synthetic-token-family",
+        csrf_token=opaque_session_id(),
         access_token="header.payload.signature",
         id_token="header.payload.signature",
         refresh_token="synthetic-refresh-token",
@@ -187,7 +188,7 @@ def test_session_uses_independent_opaque_cookie_digest_key_and_bounded_record(
     assert nx is True
     assert expiry == handle.max_age
     document = json.loads(serialized)
-    assert document["version"] == 2
+    assert document["version"] == 3
     assert document["refresh_version"] == 0
     assert document["access_token"] == "header.payload.signature"
     assert len(serialized) <= settings.max_session_bytes

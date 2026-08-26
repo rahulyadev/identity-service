@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from reference_bff.config import Settings
 from reference_bff.flow import CallbackFlowError
+from reference_bff.profile_updates import RawProfilePatch
 from reference_bff.session_flow import SessionReadError, SessionReadResult
 from reference_bff.sessions import SessionHandle, SessionRecord, StoredSession, opaque_session_id
 from reference_bff.store import TransactionStoreUnavailableError
@@ -135,14 +136,22 @@ class FakeSessionReader:
             },
             etag='"v1"',
             max_age=43_200,
+            csrf_token=opaque_session_id(),
         )
         self.failure: SessionReadError | None = None
         self.calls: list[str] = []
+        self.patch_calls: list[tuple[str, RawProfilePatch]] = []
         self.available = True
         self.closed = False
 
     async def read(self, session_id: str) -> SessionReadResult:
         self.calls.append(session_id)
+        if self.failure is not None:
+            raise self.failure
+        return self.result
+
+    async def patch(self, session_id: str, raw: RawProfilePatch) -> SessionReadResult:
+        self.patch_calls.append((session_id, raw))
         if self.failure is not None:
             raise self.failure
         return self.result

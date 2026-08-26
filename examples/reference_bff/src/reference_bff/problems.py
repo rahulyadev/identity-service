@@ -9,8 +9,13 @@ from starlette.responses import JSONResponse
 PROBLEM_TITLES = {
     400: "Bad Request",
     401: "Unauthorized",
+    403: "Forbidden",
     404: "Not Found",
     405: "Method Not Allowed",
+    412: "Precondition Failed",
+    415: "Unsupported Media Type",
+    422: "Unprocessable Content",
+    428: "Precondition Required",
     500: "Internal Server Error",
     503: "Service Unavailable",
 }
