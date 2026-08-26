@@ -136,6 +136,10 @@ def validate_profile_patch(raw: RawProfilePatch) -> ValidatedProfilePatch:
         display_name = display_name.strip()
         if not display_name or len(display_name) > 100:
             raise ProfilePatchFailure(422, "validation_failed")
+        try:
+            display_name.encode("utf-8", errors="strict")
+        except UnicodeEncodeError:
+            raise ProfilePatchFailure(422, "validation_failed") from None
     canonical = json.dumps(
         {"display_name": display_name},
         ensure_ascii=False,

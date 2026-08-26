@@ -231,3 +231,38 @@ def test_profile_patch_failures_never_expose_csrf_or_renew_valid_cookie(
     assert "x-csrf-token" not in response.headers
     assert reader.result.csrf_token not in response.text
     assert ("set-cookie" in response.headers) is clear
+
+
+def test_profile_patch_unsafe_unicode_422_exposes_nothing_and_does_not_renew_cookie(
+    bff_settings_factory: Callable[..., Settings],
+) -> None:
+    settings = bff_settings_factory()
+    app, reader = app_stack(settings)
+    reader.failure = SessionReadError(422, "validation_failed", False)
+    session_id = opaque_session_id()
+    unsafe_body = rb'{"display_name":"\ud800"}'
+    with ASGIClient(app) as client:
+        response = client.request(
+            "PATCH",
+            "/api/me",
+            headers={
+                "cookie": f"__Host-session={session_id}",
+                "origin": settings.bff_origin,
+                "x-csrf-token": reader.result.csrf_token,
+                "if-match": '"v1"',
+                "content-type": "application/merge-patch+json",
+            },
+            content=unsafe_body,
+        )
+
+    assert response.status_code == 422
+    assert response.json()["code"] == "validation_failed"
+    assert "x-csrf-token" not in response.headers
+    assert "set-cookie" not in response.headers
+    assert "access-control-allow-origin" not in response.headers
+    assert reader.result.csrf_token not in response.text
+    assert session_id not in response.text
+    assert "\\ud800" not in response.text
+    assert len(reader.patch_calls) == 1
+    assert reader.patch_calls[0][0] == session_id
+    assert reader.patch_calls[0][1].body == unsafe_body

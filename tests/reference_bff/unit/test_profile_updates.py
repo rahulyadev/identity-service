@@ -196,6 +196,8 @@ def test_profile_patch_media_and_precondition_are_duplicate_sensitive(
         (json.dumps({"display_name": "\nname"}).encode(), 422, "validation_failed"),
         (json.dumps({"display_name": "bad\u2028name"}).encode(), 422, "validation_failed"),
         (json.dumps({"display_name": "bad\u2029name"}).encode(), 422, "validation_failed"),
+        (rb'{"display_name":"\ud800"}', 422, "validation_failed"),
+        (rb'{"display_name":"\udfff"}', 422, "validation_failed"),
     ],
 )
 def test_profile_patch_json_and_display_name_validation_is_exact(
@@ -208,3 +210,17 @@ def test_profile_patch_json_and_display_name_validation_is_exact(
     with pytest.raises(ProfilePatchFailure) as captured:
         validate_profile_patch(raw)
     assert (captured.value.status, captured.value.code) == (status, code)
+
+
+def test_profile_patch_accepts_surrogate_pair_as_canonical_supplementary_utf8(
+    bff_settings_factory: Callable[..., Settings],
+) -> None:
+    raw = raw_patch(
+        bff_settings_factory(),
+        "Q" * 43,
+        body=rb'{"display_name":"\ud83d\ude00"}',
+    )
+
+    parsed = validate_profile_patch(raw)
+
+    assert parsed.body == b'{"display_name":"\xf0\x9f\x98\x80"}'

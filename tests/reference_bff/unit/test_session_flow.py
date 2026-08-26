@@ -20,6 +20,7 @@ from reference_bff.sessions import (
     SessionHandle,
     SessionRecord,
     StoredSession,
+    new_csrf_token,
     opaque_session_id,
 )
 from reference_bff.store import TransactionStoreUnavailableError
@@ -249,6 +250,7 @@ def test_valid_csrf_profile_patch_normalizes_and_forwards_only_canonical_server_
         ("wrong-csrf", 403, "csrf_failed"),
         ("wrong-origin", 403, "csrf_failed"),
         ("bad-precondition", 400, "invalid_precondition"),
+        ("unsafe-unicode", 422, "validation_failed"),
     ],
 )
 def test_profile_patch_denials_precede_touch_refresh_and_identity(
@@ -272,6 +274,9 @@ def test_profile_patch_denials_precede_touch_refresh_and_identity(
         token,
         origin="http://attacker.invalid" if mode == "wrong-origin" else None,
         if_match='W/"v1"' if mode == "bad-precondition" else '"v1"',
+        body=rb'{"display_name":"\ud800"}'
+        if mode == "unsafe-unicode"
+        else b'{"display_name":null}',
     )
 
     async def scenario() -> None:
@@ -279,6 +284,8 @@ def test_profile_patch_denials_precede_touch_refresh_and_identity(
             await flow.patch(session_id, raw)
         assert (captured.value.status, captured.value.code) == (status, code)
         assert captured.value.clear_cookie is False
+        if mode == "unsafe-unicode":
+            assert "\\ud800" not in str(captured.value)
         await flow.close()
 
     run(scenario())
@@ -287,6 +294,65 @@ def test_profile_patch_denials_precede_touch_refresh_and_identity(
     assert store.cas_calls == 0
     assert store.invalidate_calls == 0
     assert store.stored is not None and store.stored.serialized == original
+
+
+def test_csrf_token_from_an_independently_stored_session_cannot_authorize_another(
+    bff_settings_factory: Callable[..., Settings],
+) -> None:
+    class TwoSessionStore(MemorySessionStore):
+        def __init__(self, sessions: dict[str, StoredSession]) -> None:
+            super().__init__(next(iter(sessions.values())))
+            self.sessions = sessions
+            self.load_calls: list[str] = []
+
+        async def load_session(self, session_id: str) -> StoredSession | None:
+            self.load_calls.append(session_id)
+            return self.sessions.get(session_id)
+
+    now = int(time.time())
+    settings = bff_settings_factory()
+    flow, original_store, provider, _upstream, _unused_id = stack(
+        settings,
+        now=now,
+        access_lifetime=settings.session_refresh_window_seconds,
+    )
+    assert original_store.stored is not None
+    session_a_id = opaque_session_id()
+    session_b_id = opaque_session_id()
+    session_a = original_store.stored
+    session_b = StoredSession.from_record(
+        replace(
+            session_a.record,
+            nonce=opaque_session_id(),
+            csrf_token=new_csrf_token(),
+        )
+    )
+    assert session_a.record.csrf_token != session_b.record.csrf_token
+    store = TwoSessionStore({session_a_id: session_a, session_b_id: session_b})
+    flow._store = store
+    original_a = session_a.serialized
+    original_b = session_b.serialized
+
+    async def scenario() -> None:
+        with pytest.raises(SessionReadError) as captured:
+            await flow.patch(
+                session_a_id,
+                patch_request(settings, session_b.record.csrf_token),
+            )
+        assert (captured.value.status, captured.value.code) == (403, "csrf_failed")
+        assert captured.value.clear_cookie is False
+        assert session_a.record.csrf_token not in str(captured.value)
+        assert session_b.record.csrf_token not in str(captured.value)
+        await flow.close()
+
+    run(scenario())
+    assert store.load_calls == [session_a_id]
+    assert store.sessions[session_a_id].serialized == original_a
+    assert store.sessions[session_b_id].serialized == original_b
+    assert store.cas_calls == 0
+    assert store.invalidate_calls == 0
+    assert provider.refresh_requests == 0
+    assert provider.events == []
 
 
 def test_profile_patch_conflict_is_fixed_and_identity_rejection_invalidates_exact_session(
