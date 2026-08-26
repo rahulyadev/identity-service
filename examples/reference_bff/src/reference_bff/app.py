@@ -25,12 +25,23 @@ from reference_bff.config import Settings
 from reference_bff.exchange import AuthorizationCodeClient
 from reference_bff.flow import CallbackCompleter, CallbackFlow, CallbackFlowError
 from reference_bff.http import AsyncUpstreamClient
-from reference_bff.identity import IdentityBootstrapClient
+from reference_bff.identity import IdentityBootstrapClient, IdentityProfileClient
 from reference_bff.jwks import AsyncJwksCache
 from reference_bff.logging import configure_logging
 from reference_bff.middleware import SecurityBoundaryMiddleware, get_request_id
 from reference_bff.problems import PublicProblemError, problem_response
 from reference_bff.return_targets import InvalidReturnTargetError, return_target_from_query
+from reference_bff.session_flow import (
+    SessionFlow,
+    SessionReader,
+    SessionReadError,
+    SessionReadResult,
+)
+from reference_bff.sessions import (
+    SESSION_COOKIE_NAME,
+    InvalidSessionCookieError,
+    parse_session_cookie,
+)
 from reference_bff.store import (
     RedisTransactionStore,
     TransactionStore,
@@ -62,11 +73,62 @@ def _clear_oauth_binding_cookie(response: Response) -> None:
     )
 
 
+def _set_session_cookie(response: Response, session_id: str, *, max_age: int) -> None:
+    response.set_cookie(
+        SESSION_COOKIE_NAME,
+        session_id,
+        max_age=max_age,
+        path="/",
+        secure=True,
+        httponly=True,
+        samesite="lax",
+    )
+
+
+def _clear_session_cookie(response: Response) -> None:
+    response.delete_cookie(
+        SESSION_COOKIE_NAME,
+        path="/",
+        secure=True,
+        httponly=True,
+        samesite="lax",
+    )
+
+
+class _InjectedCallbackSessionReader:
+    """Keep legacy injected callback tests isolated from a real upstream session stack."""
+
+    async def read(self, session_id: str) -> SessionReadResult:
+        del session_id
+        raise SessionReadError(503, "session_unavailable", False)
+
+    async def ready(self) -> bool:
+        return True
+
+    async def close(self) -> None:
+        return
+
+
+async def _require_empty_safe_read(request: Request) -> None:
+    headers = list(request.scope.get("headers", []))
+    if request.scope.get("query_string", b"") or any(
+        name.lower() in {b"authorization", b"transfer-encoding"} for name, _ in headers
+    ):
+        raise PublicProblemError(400, "bad_request")
+    content_lengths = [value for name, value in headers if name.lower() == b"content-length"]
+    if len(content_lengths) > 1 or (content_lengths and content_lengths[0] != b"0"):
+        raise PublicProblemError(400, "bad_request")
+    async for chunk in request.stream():
+        if chunk:
+            raise PublicProblemError(400, "bad_request")
+
+
 def create_app(
     settings: Settings | None = None,
     *,
     transaction_store: TransactionStore | None = None,
     callback_service: CallbackCompleter | None = None,
+    session_reader: SessionReader | None = None,
 ) -> FastAPI:
     resolved = settings or Settings()
     configure_logging(resolved)
@@ -88,20 +150,42 @@ def create_app(
             )
         else:
             service = callback_service
+        if session_reader is not None:
+            profile_reader = session_reader
+        elif callback_service is not None:
+            profile_reader = _InjectedCallbackSessionReader()
+        else:
+            session_upstream = AsyncUpstreamClient(resolved)
+            session_jwks = AsyncJwksCache(resolved, session_upstream)
+            session_verifier = CognitoTokenVerifier(resolved, session_jwks)
+            profile_reader = SessionFlow(
+                settings=resolved,
+                upstream=session_upstream,
+                jwks=session_jwks,
+                refresh=AuthorizationCodeClient(resolved, session_upstream),
+                verifier=session_verifier,
+                identity=IdentityProfileClient(resolved, session_upstream),
+                store=store,
+            )
         app.state.transaction_store = store
         app.state.callback_service = service
+        app.state.session_reader = profile_reader
         try:
             yield
         finally:
             try:
-                await service.close()
+                await profile_reader.close()
             finally:
-                await store.close()
+                try:
+                    await service.close()
+                finally:
+                    await store.close()
 
     docs_url = "/docs" if resolved.enable_interactive_docs else None
     app = FastAPI(
         title="reference-bff",
         version=resolved.service_version,
+        redirect_slashes=False,
         docs_url=docs_url,
         redoc_url=None,
         openapi_url="/openapi.json" if resolved.enable_interactive_docs else None,
@@ -119,7 +203,8 @@ def create_app(
     async def readiness(request: Request) -> Response:
         store: TransactionStore = request.app.state.transaction_store
         service: CallbackCompleter = request.app.state.callback_service
-        if not await store.ready() or not await service.ready():
+        profile_reader: SessionReader = request.app.state.session_reader
+        if not await store.ready() or not await service.ready() or not await profile_reader.ready():
             return problem_response(
                 503, "transaction_store_unavailable", get_request_id(request.scope)
             )
@@ -216,6 +301,29 @@ def create_app(
         )
         logging.getLogger("reference_bff.http").info("browser_session_created")
         return redirect_response
+
+    @app.get("/api/me", include_in_schema=False)
+    async def profile(request: Request) -> Response:
+        await _require_empty_safe_read(request)
+        try:
+            session_id = parse_session_cookie(list(request.scope.get("headers", [])))
+        except InvalidSessionCookieError:
+            missing_response = problem_response(
+                401, "session_required", get_request_id(request.scope)
+            )
+            _clear_session_cookie(missing_response)
+            return missing_response
+        profile_reader: SessionReader = request.app.state.session_reader
+        try:
+            result = await profile_reader.read(session_id)
+        except SessionReadError as error:
+            failure = problem_response(error.status, error.code, get_request_id(request.scope))
+            if error.clear_cookie:
+                _clear_session_cookie(failure)
+            return failure
+        response = JSONResponse(result.profile, headers={"ETag": result.etag})
+        _set_session_cookie(response, session_id, max_age=result.max_age)
+        return response
 
     @app.exception_handler(PublicProblemError)
     async def public_problem_handler(request: Request, error: PublicProblemError) -> Response:

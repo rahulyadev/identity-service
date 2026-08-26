@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import hmac
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -24,12 +25,27 @@ class CodeExchangeUnavailableError(RuntimeError):
     """The token endpoint failed or returned an unsafe response."""
 
 
-@dataclass(frozen=True, slots=True)
+class RefreshUnavailableError(RuntimeError):
+    """The refresh endpoint or its safe response boundary is temporarily unavailable."""
+
+
+class RefreshRejectedError(ValueError):
+    """The provider definitively rejected the exact stored refresh grant."""
+
+
+class InvalidRefreshResponseError(ValueError):
+    """A nominally successful refresh omitted or corrupted rotated token material."""
+
+
+@dataclass(frozen=True, slots=True, repr=False)
 class TokenResponse:
     access_token: str = field(repr=False)
     id_token: str = field(repr=False)
     refresh_token: str = field(repr=False)
     expires_in: int
+
+    def __repr__(self) -> str:
+        return "TokenResponse(<redacted>)"
 
 
 class AuthorizationCodeClient:
@@ -38,18 +54,13 @@ class AuthorizationCodeClient:
         self._client = client
 
     async def exchange(self, code: str, transaction: AuthorizationTransaction) -> TokenResponse:
-        credential = base64.b64encode(
-            (
-                f"{self._settings.client_id}:{self._settings.client_secret.get_secret_value()}"
-            ).encode()
-        ).decode("ascii")
         try:
             response = await self._client.request(
                 "POST",
                 self._settings.token_endpoint,
                 headers={
                     "Accept": "application/json",
-                    "Authorization": f"Basic {credential}",
+                    "Authorization": f"Basic {self._basic_credential()}",
                     "Content-Type": "application/x-www-form-urlencoded",
                 },
                 data={
@@ -72,6 +83,49 @@ class AuthorizationCodeClient:
             return self._parse(document)
         except UnsafeJsonError, TypeError, ValueError:
             raise CodeExchangeUnavailableError("token endpoint returned invalid data") from None
+
+    async def refresh(self, refresh_token: str) -> TokenResponse:
+        """Request one complete rotated token set with confidential Basic authentication."""
+
+        try:
+            response = await self._client.request(
+                "POST",
+                self._settings.token_endpoint,
+                headers={
+                    "Accept": "application/json",
+                    "Authorization": f"Basic {self._basic_credential()}",
+                    "Content-Type": "application/x-www-form-urlencoded",
+                },
+                data={
+                    "grant_type": "refresh_token",
+                    "client_id": self._settings.client_id,
+                    "refresh_token": refresh_token,
+                },
+            )
+        except UpstreamError:
+            raise RefreshUnavailableError("token refresh is unavailable") from None
+        if response.status_code in {400, 401}:
+            raise RefreshRejectedError("refresh grant was rejected")
+        if response.status_code != 200 or not json_media_type(
+            response.headers,
+            allowed=JSON_MEDIA_TYPES,
+        ):
+            raise RefreshUnavailableError("token endpoint returned an unsafe response")
+        try:
+            document = load_json_object(response.body)
+            rotated = self._parse(document)
+        except UnsafeJsonError, TypeError, ValueError:
+            raise InvalidRefreshResponseError("rotated token response is invalid") from None
+        if hmac.compare_digest(rotated.refresh_token, refresh_token):
+            raise InvalidRefreshResponseError("refresh token did not rotate")
+        return rotated
+
+    def _basic_credential(self) -> str:
+        return base64.b64encode(
+            (
+                f"{self._settings.client_id}:{self._settings.client_secret.get_secret_value()}"
+            ).encode()
+        ).decode("ascii")
 
     @staticmethod
     def _parse(document: dict[str, Any]) -> TokenResponse:

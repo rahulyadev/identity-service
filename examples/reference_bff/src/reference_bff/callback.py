@@ -7,17 +7,13 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from urllib.parse import quote, unquote_to_bytes
 
+from reference_bff.cookies import InvalidCookieHeaderError, parse_cookie_headers
 from reference_bff.transactions import OPAQUE_TOKEN
 
 OAUTH_CODE = re.compile(r"[\x21-\x7e]{1,8192}")
 PROVIDER_ERROR = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{0,255}")
 PERCENT_ESCAPE = re.compile(r"%[0-9A-F]{2}")
-COOKIE_NAME = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]{1,256}")
-COOKIE_VALUE = re.compile(r"[\x21-\x2B\x2D-\x3A\x3C-\x5B\x5D-\x7E]{0,4096}")
 OAUTH_BINDING_COOKIE_NAME = "__Host-oauth"
-MAX_COOKIE_HEADER_BYTES = 8192
-MAX_COOKIE_HEADERS = 16
-MAX_COOKIE_PAIRS = 64
 
 
 class InvalidCallbackQueryError(ValueError):
@@ -53,44 +49,11 @@ def parse_oauth_browser_binding(
 ) -> OAuthBrowserBinding:
     """Parse raw ASGI Cookie fields without duplicate collapsing or reflection."""
 
-    total_bytes = 0
-    cookie_headers = 0
-    cookie_pairs = 0
-    oauth_value: str | None = None
-    for raw_name, raw_value in headers:
-        if raw_name.lower() != b"cookie":
-            continue
-        cookie_headers += 1
-        total_bytes += len(raw_name) + len(raw_value)
-        if (
-            cookie_headers > MAX_COOKIE_HEADERS
-            or total_bytes > MAX_COOKIE_HEADER_BYTES
-            or not raw_value
-            or any(value < 0x20 or value > 0x7E for value in raw_value)
-        ):
-            raise InvalidOAuthBrowserBindingError("invalid OAuth browser binding")
-        try:
-            text = raw_value.decode("ascii", errors="strict")
-        except UnicodeError:
-            raise InvalidOAuthBrowserBindingError("invalid OAuth browser binding") from None
-        for position, raw_pair in enumerate(text.split(";")):
-            pair = raw_pair[1:] if position > 0 and raw_pair.startswith(" ") else raw_pair
-            cookie_pairs += 1
-            if (
-                cookie_pairs > MAX_COOKIE_PAIRS
-                or not pair
-                or pair != pair.strip(" ")
-                or "=" not in pair
-            ):
-                raise InvalidOAuthBrowserBindingError("invalid OAuth browser binding")
-            name, _, value = pair.partition("=")
-            if COOKIE_NAME.fullmatch(name) is None or COOKIE_VALUE.fullmatch(value) is None:
-                raise InvalidOAuthBrowserBindingError("invalid OAuth browser binding")
-            if name == OAUTH_BINDING_COOKIE_NAME:
-                if oauth_value is not None or OPAQUE_TOKEN.fullmatch(value) is None:
-                    raise InvalidOAuthBrowserBindingError("invalid OAuth browser binding")
-                oauth_value = value
-    if oauth_value is None:
+    try:
+        oauth_value = parse_cookie_headers(headers).get(OAUTH_BINDING_COOKIE_NAME)
+    except InvalidCookieHeaderError:
+        raise InvalidOAuthBrowserBindingError("invalid OAuth browser binding") from None
+    if oauth_value is None or OPAQUE_TOKEN.fullmatch(oauth_value) is None:
         raise InvalidOAuthBrowserBindingError("invalid OAuth browser binding")
     return OAuthBrowserBinding(transaction_id=oauth_value)
 

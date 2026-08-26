@@ -30,6 +30,10 @@ def test_settings_are_typed_derived_and_secret_safe(
     assert settings.port == 8081
     assert settings.callback_uri == "http://localhost:8081/auth/callback"
     assert settings.oauth_transaction_ttl_seconds == 300
+    assert settings.session_refresh_window_seconds == 120
+    assert settings.refresh_lock_lease_seconds == 10
+    assert settings.refresh_wait_timeout_ms == 1500
+    assert settings.refresh_poll_interval_ms == 25
     assert sentinel not in repr(settings)
     assert redis_password not in repr(settings)
     assert sentinel not in str(settings)
@@ -187,6 +191,9 @@ def test_strict_scalar_string_forms_are_accepted(
         {"bff_origin": "http://127.0.0.1:8081", "allowed_hosts": ["localhost"]},
         {"jwks_cache_max_age_seconds": 301, "jwks_stale_if_error_seconds": 300},
         {"session_idle_seconds": 7200, "session_absolute_seconds": 3600},
+        {"session_idle_seconds": 300, "session_refresh_window_seconds": 300},
+        {"refresh_wait_timeout_ms": 100, "refresh_poll_interval_ms": 100},
+        {"refresh_lock_lease_seconds": 3, "refresh_wait_timeout_ms": 3000},
     ],
 )
 def test_additional_strict_configuration_branches_reject(

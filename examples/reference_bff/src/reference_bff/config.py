@@ -262,6 +262,18 @@ class Settings(BaseSettings):
     max_session_bytes: EnvInt = Field(
         default=65_536, ge=4096, le=262_144, validation_alias="MAX_SESSION_BYTES"
     )
+    session_refresh_window_seconds: EnvInt = Field(
+        default=120, ge=30, le=900, validation_alias="SESSION_REFRESH_WINDOW_SECONDS"
+    )
+    refresh_lock_lease_seconds: EnvInt = Field(
+        default=10, ge=3, le=30, validation_alias="REFRESH_LOCK_LEASE_SECONDS"
+    )
+    refresh_wait_timeout_ms: EnvInt = Field(
+        default=1500, ge=100, le=10_000, validation_alias="REFRESH_WAIT_TIMEOUT_MS"
+    )
+    refresh_poll_interval_ms: EnvInt = Field(
+        default=25, ge=10, le=500, validation_alias="REFRESH_POLL_INTERVAL_MS"
+    )
 
     @field_validator("service_version")
     @classmethod
@@ -398,6 +410,14 @@ class Settings(BaseSettings):
             raise ValueError("JWKS_STALE_IF_ERROR_SECONDS must include the fresh-cache lifetime")
         if self.session_absolute_seconds < self.session_idle_seconds:
             raise ValueError("SESSION_ABSOLUTE_SECONDS must not be shorter than the idle lifetime")
+        if self.session_refresh_window_seconds >= self.session_idle_seconds:
+            raise ValueError(
+                "SESSION_REFRESH_WINDOW_SECONDS must be shorter than the idle lifetime"
+            )
+        if self.refresh_poll_interval_ms >= self.refresh_wait_timeout_ms:
+            raise ValueError("refresh polling must fit inside the bounded wait")
+        if self.refresh_wait_timeout_ms >= self.refresh_lock_lease_seconds * 1000:
+            raise ValueError("refresh waiting must finish before the coordination lease")
         if self.app_env.deployed:
             if origin.scheme != "https" or _is_loopback(origin.hostname or ""):
                 raise ValueError("deployed BFF_ORIGIN requires non-loopback HTTPS")
@@ -454,4 +474,8 @@ class Settings(BaseSettings):
             "oauth_transaction_ttl_seconds": self.oauth_transaction_ttl_seconds,
             "session_idle_seconds": self.session_idle_seconds,
             "session_absolute_seconds": self.session_absolute_seconds,
+            "session_refresh_window_seconds": self.session_refresh_window_seconds,
+            "refresh_lock_lease_seconds": self.refresh_lock_lease_seconds,
+            "refresh_wait_timeout_ms": self.refresh_wait_timeout_ms,
+            "refresh_poll_interval_ms": self.refresh_poll_interval_ms,
         }

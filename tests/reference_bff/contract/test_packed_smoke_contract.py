@@ -140,3 +140,21 @@ def test_compose_derives_exact_bff_endpoints_from_one_fixture_origin() -> None:
 
     assert derived == expected
     assert COMPOSE_PATH.read_text(encoding="utf-8").count(fallback) == 5
+
+
+def test_compose_fixes_bounded_session_refresh_coordination() -> None:
+    environment = bff_environment()
+    assert {
+        name: environment[name]
+        for name in (
+            "SESSION_REFRESH_WINDOW_SECONDS",
+            "REFRESH_LOCK_LEASE_SECONDS",
+            "REFRESH_WAIT_TIMEOUT_MS",
+            "REFRESH_POLL_INTERVAL_MS",
+        )
+    } == {
+        "SESSION_REFRESH_WINDOW_SECONDS": '"120"',
+        "REFRESH_LOCK_LEASE_SECONDS": '"10"',
+        "REFRESH_WAIT_TIMEOUT_MS": '"2000"',
+        "REFRESH_POLL_INTERVAL_MS": '"10"',
+    }

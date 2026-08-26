@@ -7,9 +7,21 @@ from typing import Any, cast
 import httpx2
 import pytest
 from reference_bff.config import Settings
-from reference_bff.exchange import AuthorizationCodeClient, CodeExchangeUnavailableError
+from reference_bff.exchange import (
+    AuthorizationCodeClient,
+    CodeExchangeUnavailableError,
+    InvalidRefreshResponseError,
+    RefreshRejectedError,
+    RefreshUnavailableError,
+)
 from reference_bff.http import AsyncUpstreamClient
-from reference_bff.identity import IdentityBootstrapClient, IdentityBootstrapUnavailableError
+from reference_bff.identity import (
+    IdentityBootstrapClient,
+    IdentityBootstrapUnavailableError,
+    IdentityProfileClient,
+    IdentityProfileUnavailableError,
+    IdentitySessionRejectedError,
+)
 from reference_bff.transactions import new_transaction
 
 from tests.reference_bff.provider import SyntheticProvider
@@ -105,6 +117,68 @@ def test_code_exchange_rejects_status_media_shape_numeric_and_token_type_abuse(
     run(scenario())
 
 
+def test_refresh_uses_exact_confidential_grant_and_requires_three_rotated_tokens(
+    bff_settings_factory: Callable[..., Settings],
+) -> None:
+    settings, provider, upstream = configured(bff_settings_factory)
+    exchange = AuthorizationCodeClient(settings, upstream)
+
+    async def scenario() -> None:
+        result = await exchange.refresh(provider.refresh_token)
+        assert result.access_token == provider.rotated_access_token
+        assert result.id_token == provider.rotated_id_token
+        assert result.refresh_token == provider.rotated_refresh_token
+        assert all(
+            value not in repr(result)
+            for value in (
+                provider.rotated_access_token,
+                provider.rotated_id_token,
+                provider.rotated_refresh_token,
+            )
+        )
+        assert repr(result) == "TokenResponse(<redacted>)"
+        await upstream.close()
+
+    run(scenario())
+    assert provider.events == ["refresh"]
+    assert provider.refresh_requests == 1
+
+
+@pytest.mark.parametrize("mode", ["rejected", "unavailable", "missing", "not-rotated"])
+def test_refresh_classifies_rejection_outage_and_invalid_rotation_without_values(
+    bff_settings_factory: Callable[..., Settings], mode: str
+) -> None:
+    settings, provider, upstream = configured(bff_settings_factory)
+    if mode == "rejected":
+        provider.refresh_status = 400
+        expected: type[Exception] = RefreshRejectedError
+    elif mode == "unavailable":
+        provider.refresh_status = 503
+        expected = RefreshUnavailableError
+    else:
+        provider.refresh_document = {
+            "access_token": provider.rotated_access_token,
+            "id_token": provider.rotated_id_token,
+            "refresh_token": provider.rotated_refresh_token,
+            "token_type": "Bearer",
+            "expires_in": 900,
+        }
+        if mode == "missing":
+            provider.refresh_document.pop("id_token")
+        else:
+            provider.refresh_document["refresh_token"] = provider.refresh_token
+        expected = InvalidRefreshResponseError
+    exchange = AuthorizationCodeClient(settings, upstream)
+
+    async def scenario() -> None:
+        with pytest.raises(expected) as captured:
+            await exchange.refresh(provider.refresh_token)
+        assert provider.refresh_token not in str(captured.value)
+        await upstream.close()
+
+    run(scenario())
+
+
 @pytest.mark.parametrize("status", [200, 201])
 def test_identity_bootstrap_accepts_only_existing_minimal_profile(
     status: int, bff_settings_factory: Callable[..., Settings]
@@ -137,7 +211,7 @@ def test_identity_bootstrap_rejects_unsafe_status_media_and_profile_shapes(
         document: dict[str, Any] = {
             "user_id": "1526af3c-c76a-4e01-a507-347205fb3c93",
             "email": None,
-            "email_verified": True,
+            "email_verified": False,
             "display_name": None,
             "avatar_url": None,
             "version": 1,
@@ -158,6 +232,101 @@ def test_identity_bootstrap_rejects_unsafe_status_media_and_profile_shapes(
     async def scenario() -> None:
         with pytest.raises(IdentityBootstrapUnavailableError) as captured:
             await identity.bootstrap(provider.access_token)
+        assert provider.access_token not in str(captured.value)
+        await upstream.close()
+
+    run(scenario())
+
+
+def test_identity_profile_read_accepts_only_exact_profile_and_matching_strong_etag(
+    bff_settings_factory: Callable[..., Settings],
+) -> None:
+    settings, provider, upstream = configured(bff_settings_factory)
+    identity = IdentityProfileClient(settings, upstream)
+
+    async def scenario() -> None:
+        profile = await identity.read(
+            provider.access_token,
+            expected_user_id="1526af3c-c76a-4e01-a507-347205fb3c93",
+        )
+        assert profile.etag == '"v1"'
+        assert set(profile.document) == {
+            "user_id",
+            "email",
+            "email_verified",
+            "display_name",
+            "avatar_url",
+            "version",
+            "created_at",
+            "updated_at",
+        }
+        assert provider.access_token not in repr(profile)
+        await upstream.close()
+
+    run(scenario())
+    assert provider.events == ["profile"]
+
+
+@pytest.mark.parametrize(
+    ("mode", "exception"),
+    [
+        ("rejected", IdentitySessionRejectedError),
+        ("status", IdentityProfileUnavailableError),
+        ("media", IdentityProfileUnavailableError),
+        ("etag", IdentityProfileUnavailableError),
+        ("version", IdentityProfileUnavailableError),
+        ("uuid", IdentityProfileUnavailableError),
+        ("timestamp", IdentityProfileUnavailableError),
+        ("extra", IdentityProfileUnavailableError),
+        ("binding", IdentityProfileUnavailableError),
+    ],
+)
+def test_identity_profile_read_has_fixed_rejection_and_unsafe_response_classes(
+    bff_settings_factory: Callable[..., Settings],
+    mode: str,
+    exception: type[Exception],
+) -> None:
+    settings, provider, upstream = configured(bff_settings_factory)
+    if mode == "rejected":
+        provider.profile_status = 401
+    elif mode == "status":
+        provider.profile_status = 503
+    elif mode == "media":
+        provider.identity_content_type = "text/plain"
+    elif mode == "etag":
+        provider.identity_etag = 'W/"v1"'
+    else:
+        now = "2026-08-25T00:00:00+00:00"
+        provider.identity_document = {
+            "user_id": "1526af3c-c76a-4e01-a507-347205fb3c93",
+            "email": None,
+            "email_verified": False,
+            "display_name": None,
+            "avatar_url": None,
+            "version": 1,
+            "created_at": now,
+            "updated_at": now,
+        }
+        if mode == "version":
+            provider.identity_etag = '"v2"'
+        elif mode == "uuid":
+            provider.identity_document["user_id"] = "not-a-uuid"
+        elif mode == "timestamp":
+            provider.identity_document["created_at"] = "2026-08-25 00:00:00+00:00"
+        elif mode == "extra":
+            provider.identity_document["subject"] = "forbidden"
+    identity = IdentityProfileClient(settings, upstream)
+
+    async def scenario() -> None:
+        with pytest.raises(exception) as captured:
+            await identity.read(
+                provider.access_token,
+                expected_user_id=(
+                    "6fcd1ec3-f96b-47d1-b22c-b06195ec7c2a"
+                    if mode == "binding"
+                    else "1526af3c-c76a-4e01-a507-347205fb3c93"
+                ),
+            )
         assert provider.access_token not in str(captured.value)
         await upstream.close()
 

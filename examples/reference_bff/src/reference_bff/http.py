@@ -103,7 +103,7 @@ class AsyncUpstreamClient:
                         raise UpstreamResponseError("upstream response is oversized")
                     body.extend(chunk)
                 safe_headers: dict[str, str] = {}
-                for name in ("content-type", "cache-control", "retry-after"):
+                for name in ("content-type", "cache-control", "retry-after", "etag"):
                     values = response.headers.get_list(name)
                     if len(values) > 1:
                         raise UpstreamResponseError("upstream response has duplicate metadata")
