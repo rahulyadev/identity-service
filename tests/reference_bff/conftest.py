@@ -21,6 +21,11 @@ def bff_settings_factory() -> Callable[..., Settings]:
             "log_format": "console",
             "enable_interactive_docs": False,
             "authorization_endpoint": "http://127.0.0.1:9000/oauth2/authorize",
+            "token_endpoint": "http://127.0.0.1:9000/oauth2/token",
+            "cognito_issuer": "http://127.0.0.1:9000/test-pool",
+            "cognito_jwks_url": "http://127.0.0.1:9000/test-pool/.well-known/jwks.json",
+            "identity_api_origin": "http://127.0.0.1:9001",
+            "oauth_resource": "identity-service://api",
             "client_id": "synthetic-reference-client",
             "client_secret": "synthetic-reference-secret",  # pragma: allowlist secret
             "requested_scopes": [
@@ -33,6 +38,10 @@ def bff_settings_factory() -> Callable[..., Settings]:
             "oauth_transaction_ttl_seconds": 300,
             "redis_connect_timeout_seconds": 1,
             "redis_operation_timeout_seconds": 1,
+            "upstream_connect_timeout_seconds": 1,
+            "upstream_read_timeout_seconds": 1,
+            "upstream_write_timeout_seconds": 1,
+            "upstream_pool_timeout_seconds": 1,
         }
         values.update(overrides)
         return Settings(**values)

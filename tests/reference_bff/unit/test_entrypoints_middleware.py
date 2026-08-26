@@ -112,6 +112,10 @@ def test_environment_backed_main_module_constructs_only_the_bff_app(
         "BFF_ORIGIN": "http://localhost:8081",
         "ALLOWED_HOSTS": '["localhost"]',
         "AUTHORIZATION_ENDPOINT": "http://127.0.0.1:9000/oauth2/authorize",
+        "TOKEN_ENDPOINT": "http://127.0.0.1:9000/oauth2/token",
+        "COGNITO_ISSUER": "http://127.0.0.1:9000/test-pool",
+        "COGNITO_JWKS_URL": "http://127.0.0.1:9000/test-pool/.well-known/jwks.json",
+        "IDENTITY_API_ORIGIN": "http://127.0.0.1:9001",
         "BFF_CLIENT_ID": "synthetic-reference-client",
         "BFF_CLIENT_SECRET": "synthetic-reference-secret",  # pragma: allowlist secret
         "REDIS_URL": "redis://127.0.0.1:56379/15",

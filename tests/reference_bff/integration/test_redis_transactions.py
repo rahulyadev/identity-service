@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
 from collections.abc import AsyncIterator, Callable
 
 import pytest
 from redis.asyncio import Redis
 from redis.exceptions import ResponseError as RedisResponseError
 from reference_bff.config import Settings
+from reference_bff.sessions import SessionRecord
 from reference_bff.store import READINESS_TTL_SECONDS, RedisTransactionStore
 from reference_bff.transactions import MalformedTransactionError
 
@@ -92,6 +94,41 @@ def test_fifty_concurrent_consumers_have_exactly_one_winner(
             results = await asyncio.gather(*(store.consume(transaction.state) for _ in range(50)))
             assert sum(result == transaction for result in results) == 1
             assert sum(result is None for result in results) == 49
+
+    run(scenario())
+
+
+@pytest.mark.redis_integration
+def test_real_redis_session_uses_digest_key_fixed_ttl_and_server_only_record(
+    bff_settings_factory: Callable[..., Settings],
+) -> None:
+    settings = redis_settings(bff_settings_factory, namespace="reference-bff:test:redis-session")
+
+    async def scenario() -> None:
+        async for store, client in _with_store(settings):
+            now = int(time.time())
+            record = SessionRecord(
+                issuer=settings.cognito_issuer,
+                subject="synthetic-subject",
+                client_id=settings.client_id,
+                user_id="1526af3c-c76a-4e01-a507-347205fb3c93",
+                access_token="synthetic-access-token",
+                id_token="synthetic-id-token-value",
+                refresh_token="synthetic-refresh-token",
+                access_expires_at=now + 900,
+                created_at=now,
+                last_activity_at=now,
+                absolute_expires_at=now + settings.session_absolute_seconds,
+            )
+            handle = await store.create_session(record)
+            key = store.key_for_session_id(handle.session_id)
+            stored = await client.get(key)
+            assert stored is not None
+            assert handle.session_id.encode() not in stored
+            assert handle.session_id not in key
+            ttl = await client.ttl(key)
+            assert 0 < ttl <= handle.max_age == settings.session_idle_seconds
+            assert await client.exists(key) == 1
 
     run(scenario())
 

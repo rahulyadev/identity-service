@@ -16,6 +16,7 @@ import uuid
 from collections.abc import Mapping
 from pathlib import Path
 
+from scripts.check_sbom import LOCK_ENTRY, locked_components, normalize_name
 from tests.fixtures.fake_cognito import FakeCognito
 from tests.fixtures.fake_cognito_server import FakeCognitoServer
 
@@ -46,6 +47,7 @@ COMMON_JSON_LOG_FIELDS = {
 }
 MAX_RAW_RESPONSE_BYTES = 16 * 1024
 RAW_STATUS = re.compile(rb"HTTP/1\.[01] ([1-5][0-9]{2}) ")
+SECURITY_DISTRIBUTIONS = ("PyJWT", "cryptography", "httpx2")
 RAW_HTTP_CASES = (
     (
         "conflicting_content_length",
@@ -77,6 +79,23 @@ RAW_HTTP_CASES = (
         b"Connection: close\r\n\r\n",
     ),
 )
+
+
+def locked_security_dependencies(path: Path) -> dict[str, str]:
+    for line in path.read_text().splitlines():
+        if (
+            line
+            and not line.startswith("#")
+            and not line[0].isspace()
+            and LOCK_ENTRY.fullmatch(line) is None
+        ):
+            raise ValueError(f"malformed package pin in {path.name}")
+
+    components = locked_components(path)
+    missing = [name for name in SECURITY_DISTRIBUTIONS if normalize_name(name) not in components]
+    if missing:
+        raise ValueError(f"required security dependencies missing from {path.name}: {missing}")
+    return {name: components[normalize_name(name)] for name in SECURITY_DISTRIBUTIONS}
 
 
 def run(
@@ -824,6 +843,7 @@ def verify_authenticated_profile_api(fake_cognito: FakeCognito) -> None:
 
 
 def main() -> int:
+    expected_security_dependencies = locked_security_dependencies(ROOT / "requirements.lock")
     fake_cognito = FakeCognito()
     fake_server = FakeCognitoServer(fake_cognito)
     fake_server.start()
@@ -930,7 +950,8 @@ def main() -> int:
             "print(json.dumps({'paths':{name:shutil.which(name) for name in names},"
             "'pip_module':importlib.util.find_spec('pip') is not None,"
             "'security_dependencies':{name:importlib.metadata.version(name) for name in "
-            "('PyJWT','cryptography','httpx2')}},sort_keys=True))"
+            f"{SECURITY_DISTRIBUTIONS!r}"
+            "}},sort_keys=True))"
         )
         tooling = json.loads(
             run(
@@ -949,11 +970,7 @@ def main() -> int:
             raise RuntimeError(
                 "build, package, VCS, cloud, or deployment tooling remains in runtime"
             )
-        if tooling["security_dependencies"] != {
-            "PyJWT": "2.13.0",
-            "cryptography": "50.0.0",
-            "httpx2": "2.12.0",
-        }:
+        if tooling["security_dependencies"] != expected_security_dependencies:
             raise RuntimeError("packed runtime security dependencies do not match the lock")
 
         artifact_probe = (

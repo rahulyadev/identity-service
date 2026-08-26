@@ -11,7 +11,10 @@ from typing import TextIO
 from reference_bff.config import Settings
 
 SENSITIVE_TEXT = re.compile(
-    r"(?i)(?:client_secret|redis_url|state|nonce|code_verifier|transaction_id|authorization)\s*[=:]\s*[^\s,]+"
+    r"(?i)(?:client_secret|redis_url|state|nonce|code|code_verifier|pkce_verifier|"
+    r"transaction_id|oauth_binding|__host-oauth|cookie|authorization|access_token|id_token|"
+    r"refresh_token|session_id|"
+    r"subject)\s*[=:]\s*[^\s,]+"
 )
 CREDENTIAL_URL = re.compile(r"(?i)(redis(?:s)?://)[^/@\s:]+(?::[^/@\s]*)?@")
 
@@ -69,3 +72,4 @@ def configure_logging(settings: Settings, *, stream: TextIO | None = None) -> No
     access.disabled = True
     access.propagate = False
     logging.getLogger("redis").setLevel(logging.WARNING)
+    logging.getLogger("httpx2").setLevel(logging.WARNING)

@@ -145,17 +145,39 @@ services:
       GRACEFUL_SHUTDOWN_SECONDS: "15"
       REDIS_CONNECT_TIMEOUT_SECONDS: "1"
       REDIS_OPERATION_TIMEOUT_SECONDS: "1"
-      AUTHORIZATION_ENDPOINT: http://127.0.0.1:9000/oauth2/authorize
+      UPSTREAM_CONNECT_TIMEOUT_SECONDS: "1"
+      UPSTREAM_READ_TIMEOUT_SECONDS: "1"
+      UPSTREAM_WRITE_TIMEOUT_SECONDS: "1"
+      UPSTREAM_POOL_TIMEOUT_SECONDS: "1"
+      UPSTREAM_MAX_RESPONSE_BYTES: "65536"
+      AUTHORIZATION_ENDPOINT: ${REFERENCE_BFF_FIXTURE_ORIGIN:-http://127.0.0.1:59000}/oauth2/authorize
+      TOKEN_ENDPOINT: ${REFERENCE_BFF_FIXTURE_ORIGIN:-http://127.0.0.1:59000}/oauth2/token
+      COGNITO_ISSUER: ${REFERENCE_BFF_FIXTURE_ORIGIN:-http://127.0.0.1:59000}/test-pool
+      COGNITO_JWKS_URL: ${REFERENCE_BFF_FIXTURE_ORIGIN:-http://127.0.0.1:59000}/test-pool/.well-known/jwks.json
+      IDENTITY_API_ORIGIN: ${REFERENCE_BFF_FIXTURE_ORIGIN:-http://127.0.0.1:59000}
+      OAUTH_RESOURCE: identity-service://api
       BFF_CLIENT_ID: synthetic-reference-client
       BFF_CLIENT_SECRET: local-reference-client-secret # pragma: allowlist secret (fixed disposable local credential)
       REQUESTED_SCOPES: '["openid","identity-service://api/profile.read","identity-service://api/profile.write"]'
-      REDIS_URL: redis://redis:6379/0
+      REDIS_URL: redis://127.0.0.1:56379/0
       REDIS_KEY_NAMESPACE: reference-bff:local:compose
       OAUTH_TRANSACTION_TTL_SECONDS: "300"
       MAX_RETURN_TO_BYTES: "2048"
       MAX_TRANSACTION_BYTES: "8192"
-    ports:
-      - "127.0.0.1:8081:8081"
+      MAX_CALLBACK_QUERY_BYTES: "8192"
+      MAX_OAUTH_CODE_BYTES: "4096"
+      MAX_PROVIDER_ERROR_BYTES: "128"
+      JWT_CLOCK_SKEW_SECONDS: "60"
+      JWT_MAX_TOKEN_BYTES: "16384"
+      JWKS_CACHE_MAX_AGE_SECONDS: "300"
+      JWKS_STALE_IF_ERROR_SECONDS: "1800"
+      JWKS_REFRESH_MIN_INTERVAL_SECONDS: "1"
+      JWKS_NEGATIVE_KID_CACHE_SECONDS: "10"
+      JWKS_MAX_KEYS: "16"
+      SESSION_IDLE_SECONDS: "43200"
+      SESSION_ABSOLUTE_SECONDS: "604800"
+      MAX_SESSION_BYTES: "65536"
+    network_mode: host
     depends_on:
       redis:
         condition: service_healthy
