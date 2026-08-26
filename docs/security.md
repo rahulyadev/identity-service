@@ -78,12 +78,19 @@ The fake provider generates ephemeral RSA keys in memory and serves only JWKS an
 integration, security, and packed-container tests. It is not copied into the runtime image and no
 deployed configuration can select its HTTP/loopback endpoints.
 
-## Not implemented
+## Browser logout boundary
 
-The Identity service has no browser OAuth behavior. The standalone BFF stops after authorization
-transaction persistence and provider redirect: there is no callback handling, authorization-code
-exchange, token validation, UserInfo/profile bootstrap, refresh, logout, cookie, session, account
-linking, username and password, public deletion/export, or production authentication bypass/mock.
+The Identity service has no browser OAuth behavior. The standalone BFF alone owns callback,
+server-side session, refresh, profile proxy, and logout behavior. Logout validates exact-origin,
+session-bound CSRF metadata before any mutation, then atomically deletes the exact Redis session.
+It makes one bounded best-effort confidential Cognito `/oauth2/revoke` call only after deletion and
+navigates the browser to Cognito `/logout` with only the client identifier and derived signed-out
+URI. The signed-out route clears both BFF cookies without consulting Redis or a provider.
+
+Cognito logout ends the Cognito managed-login session; it does not sign the user out of Google or
+another social/OIDC provider. A subsequent authorization can therefore reuse an active upstream
+provider session. The slice adds no global sign-out, provider-specific logout, account linking,
+username/password flow, or public deletion/export API.
 
 No token, authorization code, provider claim document, password, browser session, business role, or
 permission is persisted. Logs omit authorization/cookie headers, tokens, provider identifiers,

@@ -8,13 +8,14 @@ operational endpoints, migrations, observability, local containers, and automate
 The separately packaged `examples/reference_bff` application demonstrates browser login,
 confidential callback exchange, independent Cognito token validation, Identity bootstrap, and an
 opaque Redis-backed host session with demand-driven refresh, exact profile reads, and a
-CSRF-protected conditional profile update. It is not an Identity service import or runtime
-dependency, and it listens independently on local port 8081.
+CSRF-protected conditional profile update and logout. It is not an Identity service import or
+runtime dependency, and it listens independently on local port 8081.
 
 The Identity service itself does not provide Google token validation or browser sessions. Its
 Bearer-authenticated profile API remains server-to-server; the reference BFF owns the browser
-callback and cookie boundary. Unsafe methods other than the bounded profile PATCH, public refresh,
-logout, and real-provider integration remain outside the current reference slice.
+callback and cookie boundary. Unsafe methods other than the bounded profile PATCH and logout,
+public refresh/session introspection, and real-provider integration remain outside the current
+reference slice.
 
 ## Current contract
 
@@ -135,8 +136,9 @@ merely because the combined development environment contains both.
 ## Reference BFF surface
 
 The BFF exposes process liveness, Redis/JWKS-backed readiness, `GET /auth/login`,
-`GET /auth/callback`, and cookie-authenticated `GET`/`PATCH /api/me`. Login accepts one optional canonical
-local `return_to`, stores a fixed-lifetime one-time record before redirecting, and includes the
+`GET /auth/callback`, cookie-authenticated `GET`/`PATCH /api/me`, `POST /auth/logout`, and
+`GET /auth/signed-out`. Login accepts one optional canonical local `return_to`, stores a
+fixed-lifetime one-time record before redirecting, and includes the
 exact Identity resource plus scope, state, nonce, and PKCE S256 bindings. The independent
 transaction ID remains in the bounded server-side record and appears in the browser only as a
 short-lived opaque `__Host-oauth` binding.
@@ -161,6 +163,15 @@ and validated precondition reach Identity `PATCH /v1/me`. A success returns the 
 matching ETag, the same CSRF token header, and the same opaque session ID; stale writes are fixed
 `412 profile_conflict`. CSRF denials occur before refresh, touch, upstream access, or Redis writes.
 
+Logout applies the same exact session-bound CSRF and origin checks before state change, then
+atomically deletes only the loaded Redis session. Only after local deletion does the BFF make one
+bounded, best-effort confidential Cognito revocation request. Revocation failure cannot restore the
+session or change the `303` browser navigation to Cognito `/logout`, whose only query fields are the
+configured client identifier and the derived `${BFF_ORIGIN}/auth/signed-out` URI. That signed-out
+route clears both BFF cookies and returns `303 /` without Redis or provider access. Cognito logout
+does not sign the user out of Google or another social/OIDC provider, so a later login can reuse an
+active upstream provider session.
+
 OAuth transport necessarily carries state and nonce only on the provider authorization request and
 code/state or error/state only on the callback request. None of the transaction ID, state, nonce,
 code, or error values propagate into the final local redirect, response body, session cookie, other
@@ -171,8 +182,8 @@ is unrelated to OAuth material, persists only inside its server-side session, an
 only in successful same-origin profile response headers; no CORS header permits another origin to
 read it.
 Neither the login/callback binding nor `SameSite=Lax` replaces the exact CSRF validation on the
-profile PATCH. Other unsafe methods, public refresh/session introspection, logout, revocation,
-`/auth/signed-out`, real provider access, and deployment remain absent. See
+profile PATCH or logout. Other unsafe methods, public refresh/session introspection, global
+sign-out, provider-specific logout, real provider access, and deployment remain absent. See
 [the standalone example](examples/reference_bff/README.md) for its configuration boundary.
 
 This Python runtime SBOM does not inventory operating-system or container-image packages.

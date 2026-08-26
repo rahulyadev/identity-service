@@ -489,7 +489,7 @@ def test_all_response_classes_receive_restrictive_headers_without_cors(
         assert "set-cookie" not in response.headers
 
 
-def test_only_callback_is_added_while_deferred_surfaces_remain_absent(
+def test_bounded_auth_routes_are_present_while_deferred_surfaces_remain_absent(
     bff_settings_factory: Callable[..., Settings],
 ) -> None:
     settings = bff_settings_factory()
@@ -498,13 +498,13 @@ def test_only_callback_is_added_while_deferred_surfaces_remain_absent(
         callback = client.get("/auth/callback")
         assert callback.status_code == 400
         assert callback.json()["code"] == "invalid_callback"
-        for path in (
-            "/auth/logout",
-            "/auth/signed-out",
-            "/session",
-            "/sessions",
-            "/v1/me",
-        ):
+        logout = client.post("/auth/logout")
+        assert logout.status_code == 401
+        assert logout.json()["code"] == "session_required"
+        signed_out = client.get("/auth/signed-out")
+        assert signed_out.status_code == 303
+        assert signed_out.headers["location"] == "/"
+        for path in ("/session", "/sessions", "/v1/me"):
             response = client.get(path)
             assert response.status_code == 404
             assert response.json()["code"] == "not_found"

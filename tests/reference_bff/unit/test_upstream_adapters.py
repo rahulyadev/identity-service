@@ -180,6 +180,40 @@ def test_refresh_classifies_rejection_outage_and_invalid_rotation_without_values
     run(scenario())
 
 
+@pytest.mark.parametrize(
+    ("status", "body", "expected"),
+    [
+        (200, b"", True),
+        (200, b"not-empty", False),
+        (400, b'{"error":"invalid_request"}', False),
+        (401, b'{"error":"invalid_client"}', False),
+        (503, b'{"error":"unavailable"}', False),
+    ],
+)
+def test_revocation_uses_exact_confidential_contract_and_has_bounded_outcomes(
+    bff_settings_factory: Callable[..., Settings],
+    status: int,
+    body: bytes,
+    expected: bool,
+) -> None:
+    settings, provider, upstream = configured(bff_settings_factory)
+    provider.revoke_status = status
+    provider.revoke_body = body
+    exchange = AuthorizationCodeClient(settings, upstream)
+
+    async def scenario() -> None:
+        assert await exchange.revoke(provider.refresh_token) is expected
+        await upstream.close()
+
+    run(scenario())
+    assert provider.events == ["revoke"]
+    assert provider.revoke_requests == 1
+    request = provider.revoke_requests_seen[0]
+    assert request["form"] == {"token": [provider.refresh_token]}
+    assert "client_id" not in request["form"]
+    assert request["cookie"] is None
+
+
 @pytest.mark.parametrize("status", [200, 201])
 def test_identity_bootstrap_accepts_only_existing_minimal_profile(
     status: int, bff_settings_factory: Callable[..., Settings]

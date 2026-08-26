@@ -133,13 +133,11 @@ def test_profile_fixed_failures_clear_only_invalid_sessions(
         ("POST", "/api/me", {}, 405),
         ("DELETE", "/api/me", {}, 405),
         ("GET", "/api/me/", {}, 404),
-        ("POST", "/auth/logout", {}, 404),
-        ("GET", "/auth/signed-out", {}, 404),
         ("POST", "/auth/refresh", {}, 404),
         ("GET", "/api/session", {}, 404),
     ],
 )
-def test_profile_request_shape_and_deferred_surfaces_remain_closed(
+def test_profile_request_shape_and_remaining_deferred_surfaces_remain_closed(
     bff_settings_factory: Callable[..., Settings],
     method: str,
     target: str,

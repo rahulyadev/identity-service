@@ -6,7 +6,7 @@ import ipaddress
 import re
 from enum import StrEnum
 from typing import Annotated, Any, Literal, Self
-from urllib.parse import SplitResult, urlsplit
+from urllib.parse import SplitResult, urlencode, urlsplit
 
 from pydantic import BeforeValidator, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -454,6 +454,27 @@ class Settings(BaseSettings):
     def callback_uri(self) -> str:
         return f"{self.bff_origin}/auth/callback"
 
+    @property
+    def managed_login_origin(self) -> str:
+        return self.authorization_endpoint.removesuffix("/oauth2/authorize")
+
+    @property
+    def revocation_endpoint(self) -> str:
+        return f"{self.managed_login_origin}/oauth2/revoke"
+
+    @property
+    def logout_endpoint(self) -> str:
+        return f"{self.managed_login_origin}/logout"
+
+    @property
+    def signed_out_uri(self) -> str:
+        return f"{self.bff_origin}/auth/signed-out"
+
+    @property
+    def logout_redirect_uri(self) -> str:
+        query = urlencode((("client_id", self.client_id), ("logout_uri", self.signed_out_uri)))
+        return f"{self.logout_endpoint}?{query}"
+
     def safe_summary(self) -> dict[str, object]:
         return {
             "environment": self.app_env.value,
@@ -469,6 +490,9 @@ class Settings(BaseSettings):
             "identity_api_origin": self.identity_api_origin,
             "oauth_resource": self.oauth_resource,
             "callback_uri": self.callback_uri,
+            "revocation_endpoint": self.revocation_endpoint,
+            "logout_endpoint": self.logout_endpoint,
+            "signed_out_uri": self.signed_out_uri,
             "requested_scopes": list(self.requested_scopes),
             "redis_key_namespace": self.redis_key_namespace,
             "oauth_transaction_ttl_seconds": self.oauth_transaction_ttl_seconds,

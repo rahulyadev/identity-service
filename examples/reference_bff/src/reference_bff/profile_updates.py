@@ -7,6 +7,7 @@ import re
 import secrets
 import unicodedata
 from dataclasses import dataclass, field
+from typing import Protocol
 
 from reference_bff.json_safety import UnsafeJsonError, load_json_object
 from reference_bff.sessions import is_canonical_session_id
@@ -47,12 +48,17 @@ class ValidatedProfilePatch:
         return "ValidatedProfilePatch(<redacted>)"
 
 
-def _header_values(raw: RawProfilePatch, name: bytes) -> list[bytes]:
+class RawCsrfRequest(Protocol):
+    @property
+    def headers(self) -> tuple[tuple[bytes, bytes], ...]: ...
+
+
+def _header_values(raw: RawCsrfRequest, name: bytes) -> list[bytes]:
     return [value for candidate, value in raw.headers if candidate.lower() == name]
 
 
 def require_csrf(
-    raw: RawProfilePatch,
+    raw: RawCsrfRequest,
     *,
     expected_origin: str,
     expected_token: str,

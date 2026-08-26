@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import secrets
 import time
 from collections.abc import Callable
@@ -25,6 +26,7 @@ from reference_bff.identity import (
     IdentitySessionRejectedError,
 )
 from reference_bff.jwks import AsyncJwksCache
+from reference_bff.logout import LogoutRequestError, RawLogoutRequest, validate_logout_request
 from reference_bff.profile_updates import (
     ProfilePatchFailure,
     RawProfilePatch,
@@ -72,6 +74,8 @@ class SessionReader(Protocol):
     async def read(self, session_id: str) -> SessionReadResult: ...
 
     async def patch(self, session_id: str, raw: RawProfilePatch) -> SessionReadResult: ...
+
+    async def logout(self, session_id: str, raw: RawLogoutRequest) -> None: ...
 
     async def ready(self) -> bool: ...
 
@@ -182,6 +186,49 @@ class SessionFlow:
             )
         raise _session_required()
 
+    async def logout(self, session_id: str, raw: RawLogoutRequest) -> None:
+        """Invalidate one exact session before one best-effort provider revocation."""
+
+        stored = await self._load_for_logout(session_id)
+        if stored is None:
+            raise SessionReadError(401, "session_required", True)
+        try:
+            require_csrf(
+                raw,
+                expected_origin=self._settings.bff_origin,
+                expected_token=stored.record.csrf_token,
+            )
+            validate_logout_request(raw)
+        except ProfilePatchFailure as error:
+            raise SessionReadError(error.status, error.code, False) from None
+        except LogoutRequestError as error:
+            raise SessionReadError(error.status, error.code, False) from None
+
+        current = stored
+        for _ in range(MAX_CAS_ATTEMPTS):
+            if not secrets.compare_digest(
+                stored.record.csrf_token,
+                current.record.csrf_token,
+            ):
+                raise SessionReadError(403, "csrf_failed", False)
+            try:
+                deleted = await self._store.invalidate_session(session_id, current)
+            except TransactionStoreUnavailableError:
+                raise SessionReadError(503, "session_unavailable", True) from None
+            if deleted:
+                revoked = await self._refresh.revoke(current.record.refresh_token)
+                logging.getLogger("reference_bff.http").info(
+                    "provider_token_revocation_succeeded"
+                    if revoked
+                    else "provider_token_revocation_failed"
+                )
+                return
+            latest = await self._load_for_logout(session_id)
+            if latest is None:
+                raise SessionReadError(401, "session_required", True)
+            current = latest
+        raise SessionReadError(503, "session_unavailable", True)
+
     @staticmethod
     def _require_preserved_csrf(before: SessionRecord, after: SessionRecord) -> None:
         if not secrets.compare_digest(before.csrf_token, after.csrf_token):
@@ -194,6 +241,14 @@ class SessionFlow:
             raise _session_required() from None
         except TransactionStoreUnavailableError:
             raise _session_unavailable() from None
+
+    async def _load_for_logout(self, session_id: str) -> StoredSession | None:
+        try:
+            return await self._store.load_session(session_id)
+        except InvalidSessionRecordError:
+            raise SessionReadError(401, "session_required", True) from None
+        except TransactionStoreUnavailableError:
+            raise SessionReadError(503, "session_unavailable", True) from None
 
     async def _refresh_or_touch(self, session_id: str, stored: StoredSession) -> _ActiveSession:
         now = int(self._clock())

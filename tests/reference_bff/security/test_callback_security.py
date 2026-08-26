@@ -15,18 +15,17 @@ def test_bff_independently_validates_without_identity_runtime_imports() -> None:
     assert "at_hash" in source
 
 
-def test_browser_token_storage_and_all_other_deferred_unsafe_surfaces_are_absent() -> None:
+def test_browser_token_storage_and_other_deferred_unsafe_surfaces_are_absent() -> None:
     source = "\n".join(path.read_text() for path in sorted(BFF_SOURCE.glob("*.py")))
     lowered = source.casefold()
     assert "localstorage" not in lowered
     assert "sessionstorage" not in lowered
     assert "document.cookie" not in lowered
-    assert "@app.post" not in lowered
+    assert lowered.count('@app.post("/auth/logout"') == 1
     assert "@app.put" not in lowered
     assert lowered.count('@app.patch("/api/me"') == 1
     assert "@app.delete" not in lowered
-    assert '"/auth/logout"' not in source
-    assert '"/auth/signed-out"' not in source
+    assert lowered.count('@app.get("/auth/signed-out"') == 1
     assert '"/session"' not in source
     assert '"/sessions"' not in source
     assert '"/refresh"' not in source
