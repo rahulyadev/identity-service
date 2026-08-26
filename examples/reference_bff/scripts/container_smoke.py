@@ -6,6 +6,7 @@ import base64
 import hashlib
 import http.client
 import json
+import os
 import re
 import shutil
 
@@ -30,8 +31,7 @@ SECURITY_HEADERS = {
     "x-content-type-options": "nosniff",
     "x-frame-options": "DENY",
 }
-FIXTURE_PORT = 59000
-FIXTURE_ISSUER = f"http://127.0.0.1:{FIXTURE_PORT}/test-pool"
+FIXTURE_ORIGIN_ENVIRONMENT = "REFERENCE_BFF_FIXTURE_ORIGIN"
 FIXTURE_CLIENT_ID = "synthetic-reference-client"
 FIXTURE_CLIENT_SECRET = "local-reference-client-secret"  # nosec B105  # pragma: allowlist secret
 FIXTURE_RESOURCE = "identity-service://api"
@@ -59,6 +59,7 @@ class FixtureState:
     access_token: str = field(default="", repr=False)
     id_token: str = field(default="", repr=False)
     refresh_token: str = field(default="synthetic-packed-refresh-token", repr=False)
+    issuer: str = field(default="", repr=False)
     events: list[str] = field(default_factory=list)
 
     def public_jwk(self) -> dict[str, Any]:
@@ -76,9 +77,11 @@ class FixtureState:
     def issue_tokens(self) -> None:
         if self.expected_nonce is None:
             raise RuntimeError("packed fixture nonce is absent")
+        if not self.issuer:
+            raise RuntimeError("packed fixture issuer is absent")
         now = int(time.time())
         common = {
-            "iss": FIXTURE_ISSUER,
+            "iss": self.issuer,
             "sub": FIXTURE_SUBJECT,
             "iat": now,
             "auth_time": now - 1,
@@ -302,12 +305,35 @@ def assert_binding_clear(cookie: str) -> None:
         raise RuntimeError("packed BFF binding clearing cookie differs")
 
 
+def bound_fixture_origin(server: ThreadingHTTPServer) -> str:
+    address = server.server_address
+    if (
+        not isinstance(address, tuple)
+        or len(address) < 2
+        or address[0] != "127.0.0.1"
+        or isinstance(address[1], bool)
+        or not isinstance(address[1], int)
+        or not 0 < address[1] < 65_536
+    ):
+        raise RuntimeError("packed fixture did not bind a valid loopback port")
+    return f"http://127.0.0.1:{address[1]}"
+
+
 def main() -> int:
     fixture = FixtureState()
-    server = ThreadingHTTPServer(("127.0.0.1", FIXTURE_PORT), fixture_handler(fixture))
-    fixture_thread = threading.Thread(target=server.serve_forever, daemon=True)
-    fixture_thread.start()
+    server = ThreadingHTTPServer(("127.0.0.1", 0), fixture_handler(fixture))
+    fixture_thread: threading.Thread | None = None
+    fixture_thread_started = False
+    compose_attempted = False
+    previous_fixture_origin = os.environ.get(FIXTURE_ORIGIN_ENVIRONMENT)
     try:
+        fixture_origin = bound_fixture_origin(server)
+        fixture.issuer = f"{fixture_origin}/test-pool"
+        fixture_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        os.environ[FIXTURE_ORIGIN_ENVIRONMENT] = fixture_origin
+        fixture_thread.start()
+        fixture_thread_started = True
+        compose_attempted = True
         run(*COMPOSE, "up", "-d", "--wait", "redis", "bff")
         wait_for("/health/ready", 200)
         container_id = run(*COMPOSE, "ps", "-q", "bff")
@@ -462,7 +488,7 @@ def main() -> int:
         if fixture.events[-2:] != ["token", "identity"]:
             raise RuntimeError("packed BFF did not bootstrap Identity before session inspection")
         expected_record_values = {
-            "issuer": FIXTURE_ISSUER,
+            "issuer": fixture.issuer,
             "subject": FIXTURE_SUBJECT,
             "client_id": FIXTURE_CLIENT_ID,
             "user_id": FIXTURE_USER_ID,
@@ -652,10 +678,23 @@ def main() -> int:
         )
         return 0
     finally:
-        run(*COMPOSE, "down", "--volumes", "--remove-orphans", check=False)
-        server.shutdown()
-        server.server_close()
-        fixture_thread.join(timeout=5)
+        try:
+            if compose_attempted:
+                run(*COMPOSE, "down", "--volumes", "--remove-orphans", check=False)
+        finally:
+            try:
+                if fixture_thread_started:
+                    server.shutdown()
+            finally:
+                try:
+                    server.server_close()
+                    if fixture_thread_started and fixture_thread is not None:
+                        fixture_thread.join(timeout=5)
+                finally:
+                    if previous_fixture_origin is None:
+                        os.environ.pop(FIXTURE_ORIGIN_ENVIRONMENT, None)
+                    else:
+                        os.environ[FIXTURE_ORIGIN_ENVIRONMENT] = previous_fixture_origin
 
 
 if __name__ == "__main__":
