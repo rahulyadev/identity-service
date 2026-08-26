@@ -11,6 +11,7 @@ from urllib.parse import urlencode
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.requests import ClientDisconnect
 from starlette.responses import JSONResponse, RedirectResponse, Response
 
 from reference_bff.callback import (
@@ -30,6 +31,7 @@ from reference_bff.jwks import AsyncJwksCache
 from reference_bff.logging import configure_logging
 from reference_bff.middleware import SecurityBoundaryMiddleware, get_request_id
 from reference_bff.problems import PublicProblemError, problem_response
+from reference_bff.profile_updates import MAX_PROFILE_PATCH_BYTES, RawProfilePatch
 from reference_bff.return_targets import InvalidReturnTargetError, return_target_from_query
 from reference_bff.session_flow import (
     SessionFlow,
@@ -102,6 +104,10 @@ class _InjectedCallbackSessionReader:
         del session_id
         raise SessionReadError(503, "session_unavailable", False)
 
+    async def patch(self, session_id: str, raw: RawProfilePatch) -> SessionReadResult:
+        del session_id, raw
+        raise SessionReadError(503, "session_unavailable", False)
+
     async def ready(self) -> bool:
         return True
 
@@ -121,6 +127,27 @@ async def _require_empty_safe_read(request: Request) -> None:
     async for chunk in request.stream():
         if chunk:
             raise PublicProblemError(400, "bad_request")
+
+
+async def _raw_profile_patch(request: Request) -> RawProfilePatch:
+    body = bytearray()
+    complete = True
+    oversized = False
+    try:
+        async for chunk in request.stream():
+            if len(chunk) > MAX_PROFILE_PATCH_BYTES - len(body):
+                oversized = True
+                break
+            body.extend(chunk)
+    except ClientDisconnect:
+        complete = False
+    return RawProfilePatch(
+        headers=tuple(request.scope.get("headers", [])),
+        query_string=request.scope.get("query_string", b""),
+        body=bytes(body),
+        body_complete=complete,
+        body_oversized=oversized,
+    )
 
 
 def create_app(
@@ -321,7 +348,36 @@ def create_app(
             if error.clear_cookie:
                 _clear_session_cookie(failure)
             return failure
-        response = JSONResponse(result.profile, headers={"ETag": result.etag})
+        response = JSONResponse(
+            result.profile,
+            headers={"ETag": result.etag, "X-CSRF-Token": result.csrf_token},
+        )
+        _set_session_cookie(response, session_id, max_age=result.max_age)
+        return response
+
+    @app.patch("/api/me", include_in_schema=False)
+    async def update_profile(request: Request) -> Response:
+        try:
+            session_id = parse_session_cookie(list(request.scope.get("headers", [])))
+        except InvalidSessionCookieError:
+            missing_response = problem_response(
+                401, "session_required", get_request_id(request.scope)
+            )
+            _clear_session_cookie(missing_response)
+            return missing_response
+        raw = await _raw_profile_patch(request)
+        profile_reader: SessionReader = request.app.state.session_reader
+        try:
+            result = await profile_reader.patch(session_id, raw)
+        except SessionReadError as error:
+            failure = problem_response(error.status, error.code, get_request_id(request.scope))
+            if error.clear_cookie:
+                _clear_session_cookie(failure)
+            return failure
+        response = JSONResponse(
+            result.profile,
+            headers={"ETag": result.etag, "X-CSRF-Token": result.csrf_token},
+        )
         _set_session_cookie(response, session_id, max_age=result.max_age)
         return response
 

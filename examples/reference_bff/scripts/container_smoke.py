@@ -72,6 +72,10 @@ class FixtureState:
     identity_rejected: bool = False
     refresh_delay_seconds: float = 0.0
     refresh_requests: int = 0
+    profile_version: int = 1
+    profile_display_name: str | None = None
+    patch_requests: int = 0
+    patch_successes: int = 0
     token_family_id: str = field(default="synthetic-packed-token-family", repr=False)
     access_token: str = field(default="", repr=False)
     id_token: str = field(default="", repr=False)
@@ -267,6 +271,54 @@ def fixture_handler(state: FixtureState) -> type[BaseHTTPRequestHandler]:
                 },
             )
 
+        def do_PATCH(self) -> None:
+            if self.path != "/v1/me":
+                self._json(404, {"error": "not_found"})
+                return
+            state.events.append("profile-patch")
+            if state.identity_rejected:
+                self._json(401, {"error": "invalid_token"})
+                return
+            if not state.identity_available:
+                self._json(503, {"error": "unavailable"})
+                return
+            length = int(self.headers.get("Content-Length", "0"))
+            body = self.rfile.read(length)
+            if (
+                self.headers.get("Authorization") != f"Bearer {state.access_token}"
+                or self.headers.get("Accept") != "application/json"
+                or self.headers.get("Content-Type") != "application/merge-patch+json"
+                or any(
+                    self.headers.get(name) is not None
+                    for name in (
+                        "Cookie",
+                        "Origin",
+                        "Sec-Fetch-Site",
+                        "X-CSRF-Token",
+                        "X-Request-ID",
+                    )
+                )
+                or body not in {b'{"display_name":"Packed"}', b'{"display_name":null}'}
+            ):
+                self._json(400, {"error": "invalid_request"})
+                return
+            with state.lock:
+                state.patch_requests += 1
+                if self.headers.get("If-Match") != f'"v{state.profile_version}"':
+                    self._json(412, {"error": "stale"})
+                    return
+                state.profile_display_name = (
+                    "Packed" if body == b'{"display_name":"Packed"}' else None
+                )
+                state.profile_version += 1
+                state.patch_successes += 1
+                version = state.profile_version
+                display_name = state.profile_display_name
+            document = dict(PROFILE_DOCUMENT)
+            document["display_name"] = display_name
+            document["version"] = version
+            self._json(200, document, headers={"ETag": f'"v{version}"'})
+
         def do_PUT(self) -> None:
             if self.path != "/v1/me":
                 self._json(404, {"error": "not_found"})
@@ -313,13 +365,21 @@ def run(*arguments: str, check: bool = True) -> str:
     return result.stdout.strip()
 
 
-def request(path: str, *, cookie: str | None = None) -> tuple[int, dict[str, str], bytes]:
+def request(
+    path: str,
+    *,
+    cookie: str | None = None,
+    method: str = "GET",
+    headers: dict[str, str] | None = None,
+    body: bytes | None = None,
+) -> tuple[int, dict[str, str], bytes]:
     connection = http.client.HTTPConnection("127.0.0.1", 8081, timeout=3)
     try:
         request_headers = {"Host": "localhost", "Connection": "close"}
         if cookie is not None:
             request_headers["Cookie"] = cookie
-        connection.request("GET", path, headers=request_headers)
+        request_headers.update(headers or {})
+        connection.request(method, path, body=body, headers=request_headers)
         response = connection.getresponse()
         body = response.read(16_385)
         headers: dict[str, str] = {}
@@ -329,7 +389,9 @@ def request(path: str, *, cookie: str | None = None) -> tuple[int, dict[str, str
             if normalized == "set-cookie":
                 cookies.append(value)
             else:
-                headers[normalized] = value
+                headers[normalized] = (
+                    value if normalized not in headers else headers[normalized] + "\n" + value
+                )
         if cookies:
             headers["set-cookie"] = "\n".join(cookies)
         return response.status, headers, body
@@ -453,6 +515,35 @@ def concurrent_profile_reads(
 
     with ThreadPoolExecutor(max_workers=count) as executor:
         return list(executor.map(lambda _index: read(), range(count)))
+
+
+def concurrent_profile_patches(
+    session_id: str,
+    csrf_token: str,
+    *,
+    count: int = 20,
+) -> list[tuple[int, dict[str, str], bytes]]:
+    barrier = threading.Barrier(count)
+    body = b'{"display_name":"  Packed  "}'
+
+    def patch() -> tuple[int, dict[str, str], bytes]:
+        barrier.wait(timeout=5)
+        return request(
+            "/api/me",
+            cookie=f"__Host-session={session_id}",
+            method="PATCH",
+            headers={
+                "Origin": "http://localhost:8081",
+                "X-CSRF-Token": csrf_token,
+                "Sec-Fetch-Site": "same-origin",
+                "If-Match": '"v1"',
+                "Content-Type": "application/merge-patch+json",
+            },
+            body=body,
+        )
+
+    with ThreadPoolExecutor(max_workers=count) as executor:
+        return list(executor.map(lambda _index: patch(), range(count)))
 
 
 def oauth_binding_cookie(headers: dict[str, str]) -> str:
@@ -688,10 +779,25 @@ def main() -> int:
             "id_token": fixture.id_token,
             "refresh_token": fixture.refresh_token,
             "refresh_version": 0,
-            "version": 2,
+            "version": 3,
         }
         if any(stored_session.get(key) != value for key, value in expected_record_values.items()):
             raise RuntimeError("packed BFF server-side session record differs")
+        csrf_token = stored_session.get("csrf_token")
+        if (
+            not isinstance(csrf_token, str)
+            or re.fullmatch(r"[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]", csrf_token) is None
+            or csrf_token
+            in {
+                session_id,
+                fixture.expected_nonce,
+                fixture.token_family_id,
+                binding,
+                copied_binding,
+                query["state"][0],
+            }
+        ):
+            raise RuntimeError("packed BFF CSRF session binding differs")
         session_ttl = int(run(*COMPOSE, "exec", "-T", "redis", "redis-cli", "TTL", session_key))
         if not 0 < session_ttl <= 43_200:
             raise RuntimeError("packed BFF session TTL exceeds the idle bound")
@@ -711,6 +817,8 @@ def main() -> int:
                 profile_status != 200
                 or json.loads(profile_body) != PROFILE_DOCUMENT
                 or profile_headers.get("etag") != '"v1"'
+                or profile_headers.get("x-csrf-token") != csrf_token
+                or csrf_token.encode() in profile_body
             ):
                 summary = Counter(
                     (
@@ -760,6 +868,152 @@ def main() -> int:
             != "0"
         ):
             raise RuntimeError("packed BFF left a refresh lock")
+
+        session_before_denials = redis_session(session_key)
+        patch_body = b'{"display_name":"  Packed  "}'
+        denial_requests = (
+            {
+                "Origin": "http://localhost:8081",
+                "X-CSRF-Token": "Q" * 43 if csrf_token != "Q" * 43 else "E" * 43,
+                "Sec-Fetch-Site": "same-origin",
+            },
+            {
+                "Origin": "http://attacker.invalid",
+                "X-CSRF-Token": csrf_token,
+                "Sec-Fetch-Site": "cross-site",
+            },
+        )
+        for denial_headers in denial_requests:
+            events_before_denial = list(fixture.events)
+            denial_status, denial_response_headers, denial_body = request(
+                "/api/me",
+                cookie=f"__Host-session={session_id}",
+                method="PATCH",
+                headers={
+                    **denial_headers,
+                    "If-Match": '"v1"',
+                    "Content-Type": "application/merge-patch+json",
+                },
+                body=patch_body,
+            )
+            if (
+                denial_status != 403
+                or json.loads(denial_body).get("code") != "csrf_failed"
+                or "x-csrf-token" in denial_response_headers
+                or "set-cookie" in denial_response_headers
+                or csrf_token.encode() in denial_body
+                or fixture.events != events_before_denial
+                or redis_session(session_key) != session_before_denials
+            ):
+                raise RuntimeError("packed BFF CSRF denial crossed the no-mutation boundary")
+            assert_headers(denial_response_headers)
+
+        patch_results = concurrent_profile_patches(session_id, csrf_token)
+        patch_successes = [result for result in patch_results if result[0] == 200]
+        patch_conflicts = [result for result in patch_results if result[0] == 412]
+        if len(patch_successes) != 1 or len(patch_conflicts) != 19:
+            summary = Counter(
+                (status, json.loads(body).get("code")) for status, _headers, body in patch_results
+            )
+            raise RuntimeError(f"packed BFF concurrent profile patch result differs: {summary}")
+        success_status, success_headers, success_body = patch_successes[0]
+        success_document = json.loads(success_body)
+        if (
+            success_status != 200
+            or success_document.get("display_name") != "Packed"
+            or success_document.get("version") != 2
+            or success_headers.get("etag") != '"v2"'
+            or success_headers.get("x-csrf-token") != csrf_token
+            or csrf_token.encode() in success_body
+        ):
+            raise RuntimeError("packed BFF successful profile patch contract differs")
+        assert_headers(success_headers, allow_cookie=True)
+        session_cookie(success_headers, expected_session_id=session_id)
+        for conflict_status, conflict_headers, conflict_body in patch_conflicts:
+            if (
+                conflict_status != 412
+                or json.loads(conflict_body).get("code") != "profile_conflict"
+                or "x-csrf-token" in conflict_headers
+                or "set-cookie" in conflict_headers
+                or csrf_token.encode() in conflict_body
+            ):
+                raise RuntimeError("packed BFF profile conflict contract differs")
+            assert_headers(conflict_headers)
+        if fixture.patch_requests != 20 or fixture.patch_successes != 1:
+            raise RuntimeError("packed Identity profile concurrency differs")
+        session_after_patches = redis_session(session_key)
+        if (
+            session_after_patches.get("csrf_token") != csrf_token
+            or session_after_patches.get("refresh_version") != 1
+            or session_after_patches.get("refresh_token") != fixture.refresh_token
+        ):
+            raise RuntimeError("packed profile patch lost the session CSRF binding")
+        if (
+            run(
+                *COMPOSE,
+                "exec",
+                "-T",
+                "redis",
+                "redis-cli",
+                "EXISTS",
+                refresh_lock_key,
+            )
+            != "0"
+        ):
+            raise RuntimeError("packed profile patch left refresh/CAS residue")
+
+        fixture.identity_available = False
+        patch_outage_status, patch_outage_headers, patch_outage_body = request(
+            "/api/me",
+            cookie=f"__Host-session={session_id}",
+            method="PATCH",
+            headers={
+                "Origin": "http://localhost:8081",
+                "X-CSRF-Token": csrf_token,
+                "Sec-Fetch-Site": "same-origin",
+                "If-Match": '"v2"',
+                "Content-Type": "application/merge-patch+json",
+            },
+            body=b'{"display_name":null}',
+        )
+        fixture.identity_available = True
+        if (
+            patch_outage_status != 503
+            or json.loads(patch_outage_body).get("code") != "identity_unavailable"
+            or "x-csrf-token" in patch_outage_headers
+            or "set-cookie" in patch_outage_headers
+            or csrf_token.encode() in patch_outage_body
+        ):
+            raise RuntimeError("packed profile patch outage boundary differs")
+        assert_headers(patch_outage_headers)
+        clear_status, clear_headers, clear_body = request(
+            "/api/me",
+            cookie=f"__Host-session={session_id}",
+            method="PATCH",
+            headers={
+                "Origin": "http://localhost:8081",
+                "X-CSRF-Token": csrf_token,
+                "Sec-Fetch-Site": "same-origin",
+                "If-Match": '"v2"',
+                "Content-Type": "application/merge-patch+json",
+            },
+            body=b'{"display_name":null}',
+        )
+        if (
+            clear_status != 200
+            or json.loads(clear_body).get("display_name") is not None
+            or json.loads(clear_body).get("version") != 3
+            or clear_headers.get("etag") != '"v3"'
+            or clear_headers.get("x-csrf-token") != csrf_token
+            or csrf_token.encode() in clear_body
+            or fixture.patch_requests != 21
+            or fixture.patch_successes != 2
+        ):
+            raise RuntimeError("packed BFF recovered clear-profile patch differs")
+        assert_headers(clear_headers, allow_cookie=True)
+        session_cookie(clear_headers, expected_session_id=session_id)
+        if redis_session(session_key).get("csrf_token") != csrf_token:
+            raise RuntimeError("packed BFF clear-profile patch changed the CSRF binding")
 
         fixture.identity_available = False
         profile_outage_status, profile_outage_headers, profile_outage_body = request(
@@ -1029,6 +1283,8 @@ def main() -> int:
                 "transaction_id",
                 "token-family",
                 "refresh-lock",
+                "csrf_token",
+                "x-csrf-token",
             )
         ) or any(
             value and value in logs
@@ -1036,6 +1292,7 @@ def main() -> int:
                 *fixture.issued_values,
                 session_id,
                 final_session_id,
+                csrf_token,
                 copied_binding,
                 binding,
                 denied_binding,
@@ -1062,6 +1319,10 @@ def main() -> int:
             "binding_cleanup=true bootstrap_before_session=true replay_rejected=true "
             "server_side_token_custody=true browser_token_storage_absent=true "
             "profile_read=true strict_etag=true stable_session_id=true "
+            "csrf_session_binding=true csrf_header_only=true csrf_no_mutation=true "
+            "profile_patch_concurrency_20=true profile_patch_one_success=true "
+            "profile_patch_fixed_conflicts=true profile_patch_normalize_clear=true "
+            "profile_patch_outage_recovery=true "
             "refresh_single_flight_50=true refresh_version_once=true rotated_refresh=true "
             "stale_cas_rejected=true no_resurrection=true no_lock_residue=true "
             "valid_token_fallback=true expired_token_outage=true exact_invalidation=true "

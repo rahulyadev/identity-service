@@ -15,7 +15,7 @@ from reference_bff.config import Settings
 from reference_bff.cookies import InvalidCookieHeaderError, parse_cookie_headers
 from reference_bff.json_safety import UnsafeJsonError, load_json_object
 
-SESSION_SCHEMA_VERSION = 2
+SESSION_SCHEMA_VERSION = 3
 SESSION_COOKIE_NAME = "__Host-session"
 CANONICAL_SESSION_ID = re.compile(r"[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]")
 TOKEN_FAMILY_VALUE = re.compile(r"[\x21-\x7E]{1,255}")
@@ -28,6 +28,7 @@ SESSION_FIELDS = frozenset(
         "user_id",
         "nonce",
         "token_family_id",
+        "csrf_token",
         "access_token",
         "id_token",
         "refresh_token",
@@ -58,6 +59,7 @@ class SessionRecord:
     user_id: str
     nonce: str = field(repr=False)
     token_family_id: str = field(repr=False)
+    csrf_token: str = field(repr=False)
     access_token: str = field(repr=False)
     id_token: str = field(repr=False)
     refresh_token: str = field(repr=False)
@@ -81,6 +83,7 @@ class SessionRecord:
                 "user_id": self.user_id,
                 "nonce": self.nonce,
                 "token_family_id": self.token_family_id,
+                "csrf_token": self.csrf_token,
                 "access_token": self.access_token,
                 "id_token": self.id_token,
                 "refresh_token": self.refresh_token,
@@ -126,6 +129,12 @@ def opaque_session_id() -> str:
 
 def refresh_lock_owner() -> str:
     """Return an independent canonical 256-bit refresh-lock owner marker."""
+
+    return secrets.token_urlsafe(32)
+
+
+def new_csrf_token() -> str:
+    """Return an independent canonical 256-bit synchronizer token."""
 
     return secrets.token_urlsafe(32)
 
@@ -202,6 +211,9 @@ def parse_session_record(raw: bytes, settings: Settings, *, now: int) -> StoredS
     token_family = document["token_family_id"]
     if type(token_family) is not str or TOKEN_FAMILY_VALUE.fullmatch(token_family) is None:
         raise InvalidSessionRecordError("invalid session document")
+    csrf_token = document["csrf_token"]
+    if type(csrf_token) is not str or not is_canonical_session_id(csrf_token):
+        raise InvalidSessionRecordError("invalid session document")
     access_token = _token(document["access_token"], maximum=settings.jwt_max_token_bytes, jwt=True)
     id_token = _token(document["id_token"], maximum=settings.jwt_max_token_bytes, jwt=True)
     refresh_token = _token(
@@ -230,6 +242,7 @@ def parse_session_record(raw: bytes, settings: Settings, *, now: int) -> StoredS
         user_id=user_id,
         nonce=nonce,
         token_family_id=token_family,
+        csrf_token=csrf_token,
         access_token=access_token,
         id_token=id_token,
         refresh_token=refresh_token,

@@ -89,8 +89,17 @@ class AsyncUpstreamClient:
         *,
         headers: Mapping[str, str] | None = None,
         data: Mapping[str, str] | None = None,
+        content: bytes | None = None,
     ) -> UpstreamResponse:
-        request = self._client.build_request(method, url, headers=headers, data=data)
+        if data is not None and content is not None:
+            raise UpstreamResponseError("upstream request has ambiguous content")
+        request = self._client.build_request(
+            method,
+            url,
+            headers=headers,
+            data=data,
+            content=content,
+        )
         request.headers.pop("cookie", None)
         try:
             response = await self._client.send(request, stream=True, follow_redirects=False)

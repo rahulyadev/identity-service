@@ -40,6 +40,10 @@ class IdentitySessionRejectedError(ValueError):
     """Identity rejected the exact server-held access token."""
 
 
+class IdentityProfileConflictError(ValueError):
+    """Identity rejected the exact optimistic profile precondition."""
+
+
 @dataclass(frozen=True, slots=True)
 class BootstrapProfile:
     user_id: str
@@ -112,6 +116,50 @@ class IdentityProfileClient:
             raise IdentityProfileUnavailableError("Identity profile is unavailable") from None
         if response.status_code == 401:
             raise IdentitySessionRejectedError("Identity rejected the session")
+        if response.status_code != 200 or not json_media_type(
+            response.headers,
+            allowed=JSON_MEDIA_TYPES,
+        ):
+            raise IdentityProfileUnavailableError("Identity returned an unsafe response")
+        try:
+            profile = load_json_object(response.body)
+            user_id = validate_profile(profile)
+            etag = response.headers.get("etag")
+            if etag is None or user_id != expected_user_id:
+                raise ValueError("Identity profile binding is invalid")
+            match = STRONG_ETAG.fullmatch(etag)
+            if match is None or int(match.group(1)) != profile["version"]:
+                raise ValueError("Identity profile binding is invalid")
+        except UnsafeJsonError, TypeError, ValueError, OverflowError:
+            raise IdentityProfileUnavailableError("Identity returned invalid data") from None
+        return IdentityProfile(document=profile, etag=etag)
+
+    async def patch(
+        self,
+        access_token: str,
+        *,
+        expected_user_id: str,
+        if_match: str,
+        body: bytes,
+    ) -> IdentityProfile:
+        try:
+            response = await self._client.request(
+                "PATCH",
+                self._url,
+                headers={
+                    "Accept": "application/json",
+                    "Authorization": f"Bearer {access_token}",
+                    "Content-Type": "application/merge-patch+json",
+                    "If-Match": if_match,
+                },
+                content=body,
+            )
+        except UpstreamError:
+            raise IdentityProfileUnavailableError("Identity profile is unavailable") from None
+        if response.status_code in {401, 403}:
+            raise IdentitySessionRejectedError("Identity rejected the session")
+        if response.status_code == 412:
+            raise IdentityProfileConflictError("Identity rejected the profile precondition")
         if response.status_code != 200 or not json_media_type(
             response.headers,
             allowed=JSON_MEDIA_TYPES,

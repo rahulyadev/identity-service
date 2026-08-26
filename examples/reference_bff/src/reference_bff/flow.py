@@ -12,7 +12,7 @@ from reference_bff.exchange import AuthorizationCodeClient, CodeExchangeUnavaila
 from reference_bff.http import AsyncUpstreamClient
 from reference_bff.identity import IdentityBootstrapClient, IdentityBootstrapUnavailableError
 from reference_bff.jwks import AsyncJwksCache
-from reference_bff.sessions import SessionHandle, SessionRecord
+from reference_bff.sessions import SessionHandle, SessionRecord, new_csrf_token
 from reference_bff.store import TransactionStore, TransactionStoreUnavailableError
 from reference_bff.tokens import (
     CognitoTokenVerifier,
@@ -91,6 +91,7 @@ class CallbackFlow:
             user_id=profile.user_id,
             nonce=transaction.nonce,
             token_family_id=verified.token_family_id,
+            csrf_token=new_csrf_token(),
             access_token=verified.access_token,
             id_token=verified.id_token,
             refresh_token=verified.refresh_token,

@@ -11,6 +11,7 @@ from reference_bff.sessions import (
     SessionHandle,
     SessionRecord,
     is_canonical_session_id,
+    new_csrf_token,
     opaque_session_id,
     parse_session_cookie,
     parse_session_record,
@@ -28,6 +29,7 @@ def record(settings: Settings) -> SessionRecord:
         user_id="1526af3c-c76a-4e01-a507-347205fb3c93",
         nonce="A" * 43,
         token_family_id="synthetic-token-family",
+        csrf_token="Q" * 43,
         access_token="header.payload.signature",
         id_token="header.payload.signature",
         refresh_token="synthetic-refresh-token",
@@ -67,6 +69,14 @@ def test_session_cookie_requires_one_canonical_256_bit_value() -> None:
     assert session_id not in repr(handle)
 
 
+def test_csrf_tokens_are_independent_canonical_256_bit_values() -> None:
+    session_id = opaque_session_id()
+    tokens = {new_csrf_token() for _ in range(128)}
+    assert len(tokens) == 128
+    assert session_id not in tokens
+    assert all(len(token) == 43 and is_canonical_session_id(token) for token in tokens)
+
+
 def test_strict_session_round_trip_has_value_free_representations(
     bff_settings_factory: Callable[..., Settings],
 ) -> None:
@@ -80,6 +90,7 @@ def test_strict_session_round_trip_has_value_free_representations(
         original.subject,
         original.nonce,
         original.token_family_id,
+        original.csrf_token,
         original.access_token,
         original.id_token,
         original.refresh_token,
@@ -96,7 +107,7 @@ def test_strict_session_round_trip_has_value_free_representations(
 @pytest.mark.parametrize(
     ("field_name", "value"),
     [
-        ("version", 1),
+        ("version", 2),
         ("issuer", "http://127.0.0.1:9000/other-pool"),
         ("client_id", "other-client"),
         ("subject", ""),
@@ -105,6 +116,8 @@ def test_strict_session_round_trip_has_value_free_representations(
         ("nonce", "N" * 43),
         ("token_family_id", None),
         ("token_family_id", "bad\nfamily"),
+        ("csrf_token", None),
+        ("csrf_token", "Q" * 42),
         ("access_token", "not-a-jwt-token"),
         ("id_token", "not-a-jwt-token"),
         ("refresh_token", "short"),
@@ -128,9 +141,19 @@ def test_session_parser_rejects_duplicates_extra_fields_and_bounded_lifetime(
 ) -> None:
     settings = bff_settings_factory()
     raw = record(settings).as_json_bytes()
-    duplicate = raw.replace(b'"version":2', b'"version":2,"version":2')
+    duplicate = raw.replace(b'"version":3', b'"version":3,"version":3')
     extra = json.loads(raw)
     extra["provider_subject"] = "forbidden"
+    missing_csrf = json.loads(raw)
+    del missing_csrf["csrf_token"]
+    duplicate_csrf = raw.replace(
+        b'"csrf_token":"' + record(settings).csrf_token.encode() + b'"',
+        b'"csrf_token":"'
+        + record(settings).csrf_token.encode()
+        + b'","csrf_token":"'
+        + record(settings).csrf_token.encode()
+        + b'"',
+    )
     idle = json.loads(raw)
     idle["last_activity_at"] = NOW - settings.session_idle_seconds
     absolute = json.loads(raw)
@@ -142,6 +165,8 @@ def test_session_parser_rejects_duplicates_extra_fields_and_bounded_lifetime(
     for payload in (
         duplicate,
         json.dumps(extra).encode(),
+        json.dumps(missing_csrf).encode(),
+        duplicate_csrf,
         json.dumps(idle).encode(),
         json.dumps(absolute).encode(),
         json.dumps(incoherent).encode(),

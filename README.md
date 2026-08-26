@@ -7,13 +7,14 @@ operational endpoints, migrations, observability, local containers, and automate
 
 The separately packaged `examples/reference_bff` application demonstrates browser login,
 confidential callback exchange, independent Cognito token validation, Identity bootstrap, and an
-opaque Redis-backed host session with demand-driven refresh and exact profile reads. It is not an
-Identity service import or runtime dependency, and it listens independently on local port 8081.
+opaque Redis-backed host session with demand-driven refresh, exact profile reads, and a
+CSRF-protected conditional profile update. It is not an Identity service import or runtime
+dependency, and it listens independently on local port 8081.
 
 The Identity service itself does not provide Google token validation or browser sessions. Its
 Bearer-authenticated profile API remains server-to-server; the reference BFF owns the browser
-callback and cookie boundary. Unsafe application methods, public refresh, CSRF, logout, and
-real-provider integration remain outside the current reference slice.
+callback and cookie boundary. Unsafe methods other than the bounded profile PATCH, public refresh,
+logout, and real-provider integration remain outside the current reference slice.
 
 ## Current contract
 
@@ -134,7 +135,7 @@ merely because the combined development environment contains both.
 ## Reference BFF surface
 
 The BFF exposes process liveness, Redis/JWKS-backed readiness, `GET /auth/login`,
-`GET /auth/callback`, and cookie-authenticated `GET /api/me`. Login accepts one optional canonical
+`GET /auth/callback`, and cookie-authenticated `GET`/`PATCH /api/me`. Login accepts one optional canonical
 local `return_to`, stores a fixed-lifetime one-time record before redirecting, and includes the
 exact Identity resource plus scope, state, nonce, and PKCE S256 bindings. The independent
 transaction ID remains in the bounded server-side record and appears in the browser only as a
@@ -148,18 +149,30 @@ The profile read rejects query strings, bodies, browser bearer tokens, and ambig
 fields. It atomically touches the idle TTL without extending the absolute lifetime, rotates a
 complete Cognito token set at the refresh boundary through a Redis-backed per-version single
 flight, and calls only Identity `GET /v1/me` with the server-held access token. A success contains
-only the validated eight-field profile, matching strong ETag, security headers, and the renewed
-unchanged session ID. Fixed 401/503 failures never disclose upstream bodies or session material.
+only the validated eight-field profile, matching strong ETag, security headers, the unchanged
+session ID, and the independent synchronizer token in exactly one `X-CSRF-Token` response header.
+Fixed 401/503 failures never disclose upstream bodies or session material.
+
+The conditional profile update authenticates the same opaque session, then requires an exact
+`Origin` equal to `BFF_ORIGIN`, one constant-time matching canonical `X-CSRF-Token`, optional
+`Sec-Fetch-Site: same-origin`, one strong `If-Match: "vN"`, merge-patch JSON, and an exact bounded
+`display_name` member. Only the BFF's normalized one-member representation, server-held bearer,
+and validated precondition reach Identity `PATCH /v1/me`. A success returns the strict profile,
+matching ETag, the same CSRF token header, and the same opaque session ID; stale writes are fixed
+`412 profile_conflict`. CSRF denials occur before refresh, touch, upstream access, or Redis writes.
 
 OAuth transport necessarily carries state and nonce only on the provider authorization request and
 code/state or error/state only on the callback request. None of the transaction ID, state, nonce,
 code, or error values propagate into the final local redirect, response body, session cookie, other
 browser or application storage, logs, exceptions, representations, metrics, or review evidence.
 The client secret, Redis credentials, verifier, provider subjects, OAuth tokens, provider bodies,
-and session records remain outside every public surface.
-Neither the login/callback binding nor `SameSite=Lax` is a substitute for CSRF protection on future
-unsafe cookie-authenticated methods. Those methods, public refresh/session introspection, CSRF,
-logout, revocation, `/auth/signed-out`, real provider access, and deployment remain absent. See
+and session records remain outside every public surface. The browser-readable synchronizer token
+is unrelated to OAuth material, persists only inside its server-side session, and appears publicly
+only in successful same-origin profile response headers; no CORS header permits another origin to
+read it.
+Neither the login/callback binding nor `SameSite=Lax` replaces the exact CSRF validation on the
+profile PATCH. Other unsafe methods, public refresh/session introspection, logout, revocation,
+`/auth/signed-out`, real provider access, and deployment remain absent. See
 [the standalone example](examples/reference_bff/README.md) for its configuration boundary.
 
 This Python runtime SBOM does not inventory operating-system or container-image packages.

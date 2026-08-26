@@ -26,12 +26,10 @@ bootstrap:
 
 lock: bootstrap
 	$(PIP) install pip-tools==7.6.1
-	$(PYTHON) -m piptools compile --generate-hashes --allow-unsafe --strip-extras --resolver=backtracking --output-file=requirements.lock requirements.in
-	$(PYTHON) -m piptools compile --generate-hashes --allow-unsafe --strip-extras --resolver=backtracking --output-file=examples/reference_bff/requirements.lock examples/reference_bff/requirements.in
-	$(PYTHON) -m piptools compile --generate-hashes --allow-unsafe --strip-extras --resolver=backtracking --output-file=requirements-dev.lock requirements-dev.in
+	$(PYTHON) -m scripts.compile_locks
 
 lock-check:
-	$(PYTHON) scripts/check_locks.py
+	$(PYTHON) -m scripts.check_locks
 
 sync: bootstrap
 	$(PIP) install --require-hashes --no-deps -r requirements-dev.lock

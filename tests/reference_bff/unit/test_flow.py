@@ -12,6 +12,7 @@ from reference_bff.flow import CallbackFlow, CallbackFlowError
 from reference_bff.http import AsyncUpstreamClient
 from reference_bff.identity import IdentityBootstrapClient
 from reference_bff.jwks import AsyncJwksCache
+from reference_bff.sessions import is_canonical_session_id
 from reference_bff.tokens import CognitoTokenVerifier
 from reference_bff.transactions import AuthorizationTransaction, new_transaction
 
@@ -77,6 +78,14 @@ def test_complete_flow_bootstraps_before_storing_bounded_session(
     assert record.access_token == provider.access_token
     assert record.id_token == provider.id_token
     assert record.refresh_token == provider.refresh_token
+    assert is_canonical_session_id(record.csrf_token)
+    assert record.csrf_token not in {
+        record.nonce,
+        record.token_family_id,
+        store.session_handles[0].session_id,
+        transaction.transaction_id,
+        transaction.state,
+    }
     assert record.refresh_version == 0
     assert record.last_activity_at == record.created_at
     assert record.absolute_expires_at - record.created_at == settings.session_absolute_seconds
@@ -84,6 +93,7 @@ def test_complete_flow_bootstraps_before_storing_bounded_session(
     assert provider.subject not in rendered
     assert provider.access_token not in rendered
     assert provider.refresh_token not in rendered
+    assert record.csrf_token not in rendered
 
 
 @pytest.mark.parametrize(

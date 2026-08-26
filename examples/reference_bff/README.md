@@ -1,7 +1,8 @@
 # Reference BFF
 
 This standalone example completes the browser-facing authorization-code callback through session
-issuance and one cookie-authenticated profile read. It owns short-lived Redis authorization
+issuance, cookie-authenticated profile reads, and one CSRF-protected conditional profile update. It
+owns short-lived Redis authorization
 transactions, validates Cognito tokens independently, bootstraps and reads the Identity profile,
 rotates refresh tokens behind a per-session Redis single flight, and stores OAuth tokens only in an
 opaque server-side session. It does not import or run the Identity service.
@@ -22,20 +23,31 @@ The public surface is deliberately small:
 - `GET /api/me` accepts no query, body, or browser bearer token. It requires exactly one canonical
   `__Host-session` value from duplicate-safe raw Cookie fields, uses only the server-held access
   token for Identity `GET /v1/me`, strictly validates the eight-field profile and strong ETag, and
-  renews the same opaque cookie without extending the absolute session deadline.
+  renews the same opaque cookie without extending the absolute session deadline. A success exposes
+  the session's independent synchronizer token only in one `X-CSRF-Token` response header.
+- `PATCH /api/me` accepts no query, browser bearer, or ambiguous framing. After authenticating the
+  session, it requires exact same-origin `Origin`, a constant-time matching canonical
+  `X-CSRF-Token`, optional exact `Sec-Fetch-Site: same-origin`, strong `If-Match: "vN"`, exact
+  merge-patch media type, and one bounded duplicate-free `display_name` value. It forwards only a
+  newly serialized normalized one-member body, the validated ETag, and the server-held bearer to
+  Identity `PATCH /v1/me`.
 
-The browser receives no OAuth token or identity value. The cookie is an independent 256-bit opaque
-identifier with `Secure`, `HttpOnly`, `SameSite=Lax`, `Path=/`, no `Domain`, and a bounded
-`Max-Age`. Redis records are strictly parsed, versioned, use one-way derived keys, and expire no
+The browser receives no OAuth token, provider identifier, or server-side session record. Successful
+profile requests return only the strict shared profile representation. The cookie is an independent
+256-bit opaque identifier with `Secure`, `HttpOnly`, `SameSite=Lax`, `Path=/`, no `Domain`, and a
+bounded `Max-Age`. Redis records are strictly parsed, versioned, use one-way derived keys, and expire no
 later than the 12-hour idle or seven-day absolute limit. Atomic compare-and-set touch and
 replacement prevent stale overwrites, deleted-session resurrection, and absolute-lifetime
-extension. Redis loss causes reauthentication; it never loses the authoritative Identity profile.
+extension. Each session also contains a separately generated 256-bit synchronizer token that is
+preserved exactly across touch, refresh, and CAS. It never appears in a cookie, body, URL,
+redirect, ETag, log, exception, metric, or CORS header. Redis loss causes reauthentication; it
+never loses the authoritative Identity profile.
 
-Unsafe application methods, public refresh/session introspection, CSRF tokens, logout, revocation,
-and `/auth/signed-out` are intentionally absent. Cognito logout and Google logout semantics are
-therefore not implemented by this slice. `SameSite=Lax` and the login/callback browser binding are
-not the deferred CSRF protection required before any future unsafe cookie-authenticated method can
-exist.
+Unsafe application methods other than `PATCH /api/me`, public refresh/session introspection,
+logout, revocation, and `/auth/signed-out` are intentionally absent. Cognito logout and Google
+logout semantics are therefore not implemented by this slice. `SameSite=Lax` and the
+login/callback browser binding are additional controls, not substitutes for the session-bound
+synchronizer token and exact-origin checks on the profile PATCH.
 
 Refresh is internal and demand-driven. Outside the refresh window, reads use the current access
 token and atomically touch the idle TTL. At the boundary, a digest-keyed Redis lease with an
@@ -47,6 +59,14 @@ permit one read only while the current access token remains valid; after expiry 
 Identity rejection atomically invalidates the exact session and returns fixed
 `401 session_required` with cookie clearing. Unsafe Identity responses return fixed
 `503 identity_unavailable` without exposing their body.
+
+Profile update syntax failures use fixed `400`/`415`/`422`/`428` responses; failed optimistic
+preconditions use fixed `412 profile_conflict`. Missing, malformed, wrong, cross-session, or
+cross-origin CSRF metadata uses fixed `403 csrf_failed` before any refresh, touch, Identity call,
+cookie renewal, or Redis write. Successful reads and writes return the same token only in the
+response header. Because the BFF emits no CORS response header, cross-origin JavaScript cannot read
+that browser-facing token. It is not an access, ID, refresh, state, nonce, PKCE, transaction,
+session-ID, token-family, or refresh-lock value; every OAuth token remains server-only.
 
 OAuth transport necessarily places state and nonce only on the outbound provider authorization
 request, then code/state or error/state only on the inbound callback request. None of the
@@ -81,7 +101,8 @@ present, must match the exact access token.
 The repository Compose file supplies fixed disposable local credentials and Redis with persistence
 disabled. It binds the BFF on loopback port 8081 and Redis on a loopback-only test port. Packed
 validation starts an in-memory synthetic token/JWKS/Identity fixture, exercises success, denial,
-cross-browser rejection, replay, 50-way refresh-boundary concurrency, stable session-cookie renewal,
-CAS/non-resurrection/lock cleanup, provider/Identity/Redis outages and recovery, inspects the
-server-side session, and then removes the disposable stack. Production secrets and real provider
-access are not needed.
+cross-browser rejection, replay, 50-way refresh-boundary concurrency, 20-way conditional profile
+write concurrency, CSRF denial/no-mutation, normalized update and clear, stable session-cookie
+renewal, CAS/non-resurrection/lock cleanup, provider/Identity/Redis outages and recovery, inspects
+the server-side session, and then removes the disposable stack. Production secrets and real
+provider access are not needed.

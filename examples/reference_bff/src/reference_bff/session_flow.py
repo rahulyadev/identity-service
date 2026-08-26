@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import secrets
 import time
 from collections.abc import Callable
 from contextlib import suppress
@@ -19,10 +20,17 @@ from reference_bff.exchange import (
 from reference_bff.http import AsyncUpstreamClient
 from reference_bff.identity import (
     IdentityProfileClient,
+    IdentityProfileConflictError,
     IdentityProfileUnavailableError,
     IdentitySessionRejectedError,
 )
 from reference_bff.jwks import AsyncJwksCache
+from reference_bff.profile_updates import (
+    ProfilePatchFailure,
+    RawProfilePatch,
+    require_csrf,
+    validate_profile_patch,
+)
 from reference_bff.sessions import (
     InvalidSessionRecordError,
     SessionRecord,
@@ -51,6 +59,7 @@ class SessionReadResult:
     profile: dict[str, object] = field(repr=False)
     etag: str
     max_age: int
+    csrf_token: str = field(repr=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,6 +70,8 @@ class _ActiveSession:
 
 class SessionReader(Protocol):
     async def read(self, session_id: str) -> SessionReadResult: ...
+
+    async def patch(self, session_id: str, raw: RawProfilePatch) -> SessionReadResult: ...
 
     async def ready(self) -> bool: ...
 
@@ -126,8 +137,55 @@ class SessionFlow:
                 profile=dict(profile.document),
                 etag=profile.etag,
                 max_age=active.max_age,
+                csrf_token=active.stored.record.csrf_token,
             )
         raise _session_required()
+
+    async def patch(self, session_id: str, raw: RawProfilePatch) -> SessionReadResult:
+        stored = await self._load(session_id)
+        if stored is None:
+            raise _session_required()
+        try:
+            require_csrf(
+                raw,
+                expected_origin=self._settings.bff_origin,
+                expected_token=stored.record.csrf_token,
+            )
+            update = validate_profile_patch(raw)
+        except ProfilePatchFailure as error:
+            raise SessionReadError(error.status, error.code, False) from None
+
+        active = await self._refresh_or_touch(session_id, stored)
+        self._require_preserved_csrf(stored.record, active.stored.record)
+        for _ in range(2):
+            try:
+                profile = await self._identity.patch(
+                    active.stored.record.access_token,
+                    expected_user_id=active.stored.record.user_id,
+                    if_match=update.if_match,
+                    body=update.body,
+                )
+            except IdentityProfileConflictError:
+                raise SessionReadError(412, "profile_conflict", False) from None
+            except IdentityProfileUnavailableError:
+                raise _identity_unavailable() from None
+            except IdentitySessionRejectedError:
+                newer = await self._invalidate_exact_version(session_id, active.stored)
+                self._require_preserved_csrf(stored.record, newer.record)
+                active = await self._touch(session_id, newer)
+                continue
+            return SessionReadResult(
+                profile=dict(profile.document),
+                etag=profile.etag,
+                max_age=active.max_age,
+                csrf_token=active.stored.record.csrf_token,
+            )
+        raise _session_required()
+
+    @staticmethod
+    def _require_preserved_csrf(before: SessionRecord, after: SessionRecord) -> None:
+        if not secrets.compare_digest(before.csrf_token, after.csrf_token):
+            raise _session_unavailable()
 
     async def _load(self, session_id: str) -> StoredSession | None:
         try:

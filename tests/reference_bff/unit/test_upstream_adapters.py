@@ -19,6 +19,7 @@ from reference_bff.identity import (
     IdentityBootstrapClient,
     IdentityBootstrapUnavailableError,
     IdentityProfileClient,
+    IdentityProfileConflictError,
     IdentityProfileUnavailableError,
     IdentitySessionRejectedError,
 )
@@ -265,6 +266,62 @@ def test_identity_profile_read_accepts_only_exact_profile_and_matching_strong_et
 
     run(scenario())
     assert provider.events == ["profile"]
+
+
+def test_identity_profile_patch_forwards_exact_canonical_contract_without_browser_metadata(
+    bff_settings_factory: Callable[..., Settings],
+) -> None:
+    settings, provider, upstream = configured(bff_settings_factory)
+    identity = IdentityProfileClient(settings, upstream)
+
+    async def scenario() -> None:
+        profile = await identity.patch(
+            provider.access_token,
+            expected_user_id="1526af3c-c76a-4e01-a507-347205fb3c93",
+            if_match='"v1"',
+            body=b'{"display_name":"Updated"}',
+        )
+        assert profile.etag == '"v2"'
+        assert profile.document["display_name"] == "Updated"
+        assert provider.access_token not in repr(profile)
+        await upstream.close()
+
+    run(scenario())
+    assert provider.events == ["profile_patch"]
+    assert provider.patch_requests[0]["body"] == b'{"display_name":"Updated"}'
+
+
+@pytest.mark.parametrize(
+    ("status", "exception"),
+    [
+        (401, IdentitySessionRejectedError),
+        (403, IdentitySessionRejectedError),
+        (412, IdentityProfileConflictError),
+        (503, IdentityProfileUnavailableError),
+    ],
+)
+def test_identity_profile_patch_has_fixed_rejection_conflict_and_outage_classes(
+    bff_settings_factory: Callable[..., Settings],
+    status: int,
+    exception: type[Exception],
+) -> None:
+    settings, provider, upstream = configured(bff_settings_factory)
+    provider.patch_status = status
+    identity = IdentityProfileClient(settings, upstream)
+
+    async def scenario() -> None:
+        with pytest.raises(exception) as captured:
+            await identity.patch(
+                provider.access_token,
+                expected_user_id="1526af3c-c76a-4e01-a507-347205fb3c93",
+                if_match='"v1"',
+                body=b'{"display_name":null}',
+            )
+        assert provider.access_token not in str(captured.value)
+        assert b'{"display_name":null}'.decode() not in str(captured.value)
+        await upstream.close()
+
+    run(scenario())
 
 
 @pytest.mark.parametrize(

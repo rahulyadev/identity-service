@@ -13,12 +13,14 @@ from reference_bff.exchange import AuthorizationCodeClient
 from reference_bff.http import AsyncUpstreamClient
 from reference_bff.identity import IdentityProfileClient
 from reference_bff.jwks import AsyncJwksCache
+from reference_bff.profile_updates import RawProfilePatch
 from reference_bff.session_flow import SessionFlow, SessionReadError
 from reference_bff.sessions import (
     InvalidSessionRecordError,
     SessionHandle,
     SessionRecord,
     StoredSession,
+    new_csrf_token,
     opaque_session_id,
 )
 from reference_bff.store import TransactionStoreUnavailableError
@@ -135,6 +137,7 @@ def stack(
         user_id="1526af3c-c76a-4e01-a507-347205fb3c93",
         nonce=transaction.nonce,
         token_family_id=provider.token_family_id,
+        csrf_token=opaque_session_id(),
         access_token=provider.access_token,
         id_token=provider.id_token,
         refresh_token=provider.refresh_token,
@@ -164,6 +167,30 @@ def run(coroutine: Any) -> Any:
     return asyncio.run(coroutine)
 
 
+def patch_request(
+    settings: Settings,
+    csrf_token: str,
+    *,
+    if_match: str = '"v1"',
+    body: bytes = b'{"display_name":"  Updated  "}',
+    origin: str | None = None,
+) -> RawProfilePatch:
+    return RawProfilePatch(
+        headers=(
+            (b"origin", (origin or settings.bff_origin).encode()),
+            (b"x-csrf-token", csrf_token.encode()),
+            (b"sec-fetch-site", b"same-origin"),
+            (b"if-match", if_match.encode()),
+            (b"content-type", b"application/merge-patch+json"),
+            (b"content-length", str(len(body)).encode()),
+        ),
+        query_string=b"",
+        body=body,
+        body_complete=True,
+        body_oversized=False,
+    )
+
+
 def test_valid_token_outside_refresh_window_only_touches_and_reads_identity(
     bff_settings_factory: Callable[..., Settings],
 ) -> None:
@@ -183,6 +210,188 @@ def test_valid_token_outside_refresh_window_only_touches_and_reads_identity(
     run(scenario())
     assert provider.refresh_requests == 0
     assert provider.events == ["profile"]
+
+
+def test_valid_csrf_profile_patch_normalizes_and_forwards_only_canonical_server_data(
+    bff_settings_factory: Callable[..., Settings],
+) -> None:
+    now = int(time.time())
+    settings = bff_settings_factory()
+    flow, store, provider, _upstream, session_id = stack(settings, now=now, access_lifetime=900)
+    assert store.stored is not None
+    csrf_token = store.stored.record.csrf_token
+
+    async def scenario() -> None:
+        result = await flow.patch(session_id, patch_request(settings, csrf_token))
+        assert result.etag == '"v2"'
+        assert result.profile["display_name"] == "Updated"
+        assert result.csrf_token == csrf_token
+        assert store.stored is not None
+        assert store.stored.record.csrf_token == csrf_token
+        await flow.close()
+
+    run(scenario())
+    assert provider.events == ["profile_patch"]
+    assert len(provider.patch_requests) == 1
+    forwarded = provider.patch_requests[0]
+    assert forwarded["authorization"] == f"Bearer {provider.access_token}"
+    assert forwarded["if-match"] == '"v1"'
+    assert forwarded["content-type"] == "application/merge-patch+json"
+    assert forwarded["body"] == b'{"display_name":"Updated"}'
+    assert all(
+        forwarded[name] is None
+        for name in ("cookie", "origin", "sec-fetch-site", "x-csrf-token", "x-request-id")
+    )
+
+
+@pytest.mark.parametrize(
+    ("mode", "status", "code"),
+    [
+        ("wrong-csrf", 403, "csrf_failed"),
+        ("wrong-origin", 403, "csrf_failed"),
+        ("bad-precondition", 400, "invalid_precondition"),
+        ("unsafe-unicode", 422, "validation_failed"),
+    ],
+)
+def test_profile_patch_denials_precede_touch_refresh_and_identity(
+    bff_settings_factory: Callable[..., Settings],
+    mode: str,
+    status: int,
+    code: str,
+) -> None:
+    now = int(time.time())
+    settings = bff_settings_factory()
+    flow, store, provider, _upstream, session_id = stack(
+        settings,
+        now=now,
+        access_lifetime=settings.session_refresh_window_seconds,
+    )
+    assert store.stored is not None
+    original = store.stored.serialized
+    token = opaque_session_id() if mode == "wrong-csrf" else store.stored.record.csrf_token
+    raw = patch_request(
+        settings,
+        token,
+        origin="http://attacker.invalid" if mode == "wrong-origin" else None,
+        if_match='W/"v1"' if mode == "bad-precondition" else '"v1"',
+        body=rb'{"display_name":"\ud800"}'
+        if mode == "unsafe-unicode"
+        else b'{"display_name":null}',
+    )
+
+    async def scenario() -> None:
+        with pytest.raises(SessionReadError) as captured:
+            await flow.patch(session_id, raw)
+        assert (captured.value.status, captured.value.code) == (status, code)
+        assert captured.value.clear_cookie is False
+        if mode == "unsafe-unicode":
+            assert "\\ud800" not in str(captured.value)
+        await flow.close()
+
+    run(scenario())
+    assert provider.events == []
+    assert provider.refresh_requests == 0
+    assert store.cas_calls == 0
+    assert store.invalidate_calls == 0
+    assert store.stored is not None and store.stored.serialized == original
+
+
+def test_csrf_token_from_an_independently_stored_session_cannot_authorize_another(
+    bff_settings_factory: Callable[..., Settings],
+) -> None:
+    class TwoSessionStore(MemorySessionStore):
+        def __init__(self, sessions: dict[str, StoredSession]) -> None:
+            super().__init__(next(iter(sessions.values())))
+            self.sessions = sessions
+            self.load_calls: list[str] = []
+
+        async def load_session(self, session_id: str) -> StoredSession | None:
+            self.load_calls.append(session_id)
+            return self.sessions.get(session_id)
+
+    now = int(time.time())
+    settings = bff_settings_factory()
+    flow, original_store, provider, _upstream, _unused_id = stack(
+        settings,
+        now=now,
+        access_lifetime=settings.session_refresh_window_seconds,
+    )
+    assert original_store.stored is not None
+    session_a_id = opaque_session_id()
+    session_b_id = opaque_session_id()
+    session_a = original_store.stored
+    session_b = StoredSession.from_record(
+        replace(
+            session_a.record,
+            nonce=opaque_session_id(),
+            csrf_token=new_csrf_token(),
+        )
+    )
+    assert session_a.record.csrf_token != session_b.record.csrf_token
+    store = TwoSessionStore({session_a_id: session_a, session_b_id: session_b})
+    flow._store = store
+    original_a = session_a.serialized
+    original_b = session_b.serialized
+
+    async def scenario() -> None:
+        with pytest.raises(SessionReadError) as captured:
+            await flow.patch(
+                session_a_id,
+                patch_request(settings, session_b.record.csrf_token),
+            )
+        assert (captured.value.status, captured.value.code) == (403, "csrf_failed")
+        assert captured.value.clear_cookie is False
+        assert session_a.record.csrf_token not in str(captured.value)
+        assert session_b.record.csrf_token not in str(captured.value)
+        await flow.close()
+
+    run(scenario())
+    assert store.load_calls == [session_a_id]
+    assert store.sessions[session_a_id].serialized == original_a
+    assert store.sessions[session_b_id].serialized == original_b
+    assert store.cas_calls == 0
+    assert store.invalidate_calls == 0
+    assert provider.refresh_requests == 0
+    assert provider.events == []
+
+
+def test_profile_patch_conflict_is_fixed_and_identity_rejection_invalidates_exact_session(
+    bff_settings_factory: Callable[..., Settings],
+) -> None:
+    now = int(time.time())
+    settings = bff_settings_factory()
+    conflict_flow, conflict_store, provider, _upstream, session_id = stack(
+        settings, now=now, access_lifetime=900
+    )
+    assert conflict_store.stored is not None
+    csrf_token = conflict_store.stored.record.csrf_token
+    provider.patch_status = 412
+
+    async def conflict_scenario() -> None:
+        with pytest.raises(SessionReadError) as captured:
+            await conflict_flow.patch(session_id, patch_request(settings, csrf_token))
+        assert (captured.value.status, captured.value.code) == (412, "profile_conflict")
+        assert conflict_store.stored is not None
+        await conflict_flow.close()
+
+    run(conflict_scenario())
+
+    rejected_flow, rejected_store, rejected_provider, _upstream, rejected_id = stack(
+        settings, now=now, access_lifetime=900
+    )
+    assert rejected_store.stored is not None
+    rejected_token = rejected_store.stored.record.csrf_token
+    rejected_provider.patch_status = 401
+
+    async def rejected_scenario() -> None:
+        with pytest.raises(SessionReadError) as captured:
+            await rejected_flow.patch(rejected_id, patch_request(settings, rejected_token))
+        assert (captured.value.status, captured.value.code) == (401, "session_required")
+        assert captured.value.clear_cookie is True
+        assert rejected_store.stored is None
+        await rejected_flow.close()
+
+    run(rejected_scenario())
 
 
 def test_refresh_boundary_rotates_once_increments_once_and_preserves_absolute_session(
@@ -207,6 +416,7 @@ def test_refresh_boundary_rotates_once_increments_once_and_preserves_absolute_se
         assert rotated.absolute_expires_at == original.absolute_expires_at
         assert rotated.nonce == original.nonce
         assert rotated.token_family_id == original.token_family_id
+        assert rotated.csrf_token == original.csrf_token
         assert store.owner is None
         await flow.close()
 

@@ -15,7 +15,7 @@ def test_bff_independently_validates_without_identity_runtime_imports() -> None:
     assert "at_hash" in source
 
 
-def test_browser_token_storage_and_deferred_unsafe_surfaces_are_absent() -> None:
+def test_browser_token_storage_and_all_other_deferred_unsafe_surfaces_are_absent() -> None:
     source = "\n".join(path.read_text() for path in sorted(BFF_SOURCE.glob("*.py")))
     lowered = source.casefold()
     assert "localstorage" not in lowered
@@ -23,14 +23,32 @@ def test_browser_token_storage_and_deferred_unsafe_surfaces_are_absent() -> None
     assert "document.cookie" not in lowered
     assert "@app.post" not in lowered
     assert "@app.put" not in lowered
-    assert "@app.patch" not in lowered
+    assert lowered.count('@app.patch("/api/me"') == 1
     assert "@app.delete" not in lowered
     assert '"/auth/logout"' not in source
     assert '"/auth/signed-out"' not in source
     assert '"/session"' not in source
     assert '"/sessions"' not in source
     assert '"/refresh"' not in source
-    assert "csrf" not in lowered
+
+
+def test_profile_csrf_uses_raw_duplicate_sensitive_headers_and_constant_time_session_binding() -> (
+    None
+):
+    app_source = (BFF_SOURCE / "app.py").read_text()
+    flow_source = (BFF_SOURCE / "session_flow.py").read_text()
+    patch_source = (BFF_SOURCE / "profile_updates.py").read_text()
+    assert "request.headers.get" not in app_source
+    assert 'tuple(request.scope.get("headers", []))' in app_source
+    assert "_header_values" in patch_source
+    assert "secrets.compare_digest(token, expected_token)" in patch_source
+    patch_flow = flow_source.split("class SessionFlow", maxsplit=1)[1].split(
+        "async def patch", maxsplit=1
+    )[1]
+    assert patch_flow.index("require_csrf(") < patch_flow.index(
+        "self._refresh_or_touch(session_id, stored)"
+    )
+    assert "access-control-" not in app_source.casefold()
 
 
 def test_session_cookie_source_has_the_exact_host_only_security_boundary() -> None:
