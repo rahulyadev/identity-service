@@ -107,6 +107,7 @@ make sbom              generate the runtime dependency CycloneDX JSON under .cac
 make sbom-check        validate the SBOM component set against requirements.lock
 make bff-sbom-check    validate the separate BFF runtime SBOM and lock
 make security          dependency audit, SBOM, documentation, secret, and Bandit checks
+make release-workflow-check verify the fixed production image-release contract
 make docker-build      build the production runtime image
 make docker-smoke      test the packed image, outage recovery, hardening, and shutdown
 make docker-smoke-bff  test the packed BFF with disposable Redis and outage recovery
@@ -189,6 +190,26 @@ sign-out, provider-specific logout, real provider access, and deployment remain 
 This Python runtime SBOM does not inventory operating-system or container-image packages.
 Infrastructure or release automation may later combine it with an independently generated
 image-level SBOM.
+
+## Production image release
+
+The manual `release-production.yml` workflow is the only production image publisher in this
+repository. It accepts no inputs and runs only for the exact `main` commit in
+`rahulyadev/identity-service`. A separate validation job runs the complete `make validate` gate
+before the `production` environment or AWS OIDC permission is available to the release job.
+
+The release job builds both `linux/arm64` runtime targets before authenticating to the exact
+`ap-south-1` ECR registry. It uses a short-lived environment-bound role, fixed API and BFF
+repository mappings, a full-source-SHA/run-ID/attempt tag, BuildKit SBOMs, maximum provenance, and
+digest-bound attestations. Its uploaded JSON manifest contains only the source/run identity,
+platform, two digest-qualified image references, and attestation status. A partial push is
+explicitly non-deployable and is never deleted or overwritten by the workflow.
+
+The shared `python:3.14.4-slim-bookworm` base is pinned by the same official multi-architecture
+index digest in both Dockerfiles. `make release-workflow-check` parses the workflow without a shell
+and rejects trigger, trust, permission, runner, image mapping, tag, attestation, logging, or
+deployment widening. Image publication does not deploy either application, run SSM, migrate a
+database, alter runtime infrastructure, or activate production traffic.
 
 ## Operational endpoints
 

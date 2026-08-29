@@ -62,6 +62,26 @@
 The metrics endpoint is unauthenticated and must be restricted by infrastructure. There is no CORS
 middleware and direct browser access is unsupported.
 
+## Image release boundary
+
+The production image workflow has no automatic trigger or user-supplied input. It validates the
+exact protected `main` source in a job without an environment or OIDC permission. Only after that
+job succeeds can the `production` environment authorize a separate release job with
+`contents: read`, `id-token: write`, and `attestations: write`. AWS access uses one short-lived OIDC
+role for the exact account, region, registry, and two image repositories; long-lived AWS secrets,
+inherited secrets, self-hosted runners, and broad repository permissions are excluded.
+
+Both final ARM64 images use the same digest-pinned official Python multi-architecture base. Both
+must build before the first push. Published tags are unique to the full source SHA and workflow
+attempt, while every usable output is digest-qualified. BuildKit attaches an image SBOM and maximum
+provenance, and GitHub provenance is bound to each action-provided digest. Only a bounded manifest
+with non-secret release identity and attestation status is retained.
+
+A failure after one push leaves an immutable, non-deployable partial digest. The workflow neither
+deletes nor overwrites it and emits no deployment signal. It has no SSM, EC2, Secrets Manager,
+Cognito, DNS, migration, runtime, verification, rollback, or traffic operation. Image scanning and
+deployment require an independent digest-specific infrastructure decision.
+
 ## Revocation and synchronization boundary
 
 Offline signature validation does not prove current revocation state. A correctly signed access

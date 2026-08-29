@@ -1,4 +1,4 @@
-FROM python:3.14.4-slim-bookworm AS runtime-dependencies
+FROM python:3.14.4-slim-bookworm@sha256:fc74d22ffd0d5ac395a4b7bdda75a4539758862c49ebf3005647084631e63789 AS runtime-dependencies
 
 ENV VIRTUAL_ENV=/opt/venv \
     PATH=/opt/venv/bin:$PATH \
@@ -9,7 +9,7 @@ RUN python -m venv "$VIRTUAL_ENV"
 COPY examples/reference_bff/requirements.lock /tmp/requirements.lock
 RUN pip install --require-hashes --no-deps -r /tmp/requirements.lock
 
-FROM python:3.14.4-slim-bookworm AS runtime
+FROM python:3.14.4-slim-bookworm@sha256:fc74d22ffd0d5ac395a4b7bdda75a4539758862c49ebf3005647084631e63789 AS runtime
 
 ENV VIRTUAL_ENV=/opt/venv \
     PATH=/opt/venv/bin:$PATH \
