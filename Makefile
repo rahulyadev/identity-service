@@ -18,7 +18,7 @@ BFF_SBOM_PATH ?= $(CURDIR)/.cache/security/reference-bff-runtime.cdx.json
 	dependency-audit secret-scan static-security public-docs-check sbom sbom-check \
 	bff-sbom bff-sbom-check migration-heads migration-drift db-up redis-up db-down \
 	migrate app-up docker-build docker-smoke docker-build-bff docker-smoke-bff \
-	check-local-prerequisites validate-offline \
+	release-workflow-check check-local-prerequisites validate-offline \
 	validate-local validate
 
 bootstrap:
@@ -107,6 +107,9 @@ static-security:
 public-docs-check:
 	$(PYTHON) scripts/check_public_docs.py
 
+release-workflow-check:
+	$(PYTHON) scripts/check_release_workflow.py
+
 $(SBOM_PATH): requirements.lock
 	@mkdir -p $(dir $(SBOM_PATH))
 	$(PYTHON) -m pip_audit --cache-dir .cache/pip-audit --progress-spinner off --require-hashes --disable-pip -r requirements.lock --format cyclonedx-json --output $(SBOM_PATH)
@@ -164,7 +167,7 @@ check-local-prerequisites:
 	@docker info >/dev/null 2>&1 || { echo "complete validation requires access to a running Docker daemon" >&2; exit 2; }
 	@$(COMPOSE) version >/dev/null 2>&1 || { echo "complete validation requires Docker Compose" >&2; exit 2; }
 
-validate-offline: lock-check pip-check format-check lint typecheck test-unit test-contract test-security test-bff-unit test-bff-contract test-bff-security openapi-check migration-heads security
+validate-offline: lock-check pip-check format-check lint typecheck release-workflow-check test-unit test-contract test-security test-bff-unit test-bff-contract test-bff-security openapi-check migration-heads security
 
 validate-local: check-local-prerequisites
 	$(MAKE) validate-offline

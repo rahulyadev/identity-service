@@ -109,6 +109,37 @@ and production, while `/openapi.json` remains available as the stable machine-re
 `make validate-local` is the complete gate and fails at one explicit prerequisite check when Docker
 is unavailable. `make validate` aliases that complete gate rather than the offline subset.
 
+## Production image publication
+
+Production image publication is an operator-triggered GitHub workflow with no inputs. The workflow
+refuses any repository other than `rahulyadev/identity-service`, any event other than
+`workflow_dispatch`, and any ref other than `refs/heads/main`. Checkout is fixed to the complete
+40-hex dispatch SHA with credential persistence disabled. The validation job has only repository
+read permission and completes `make validate` before the environment-scoped release job can obtain
+a short-lived OIDC session.
+
+The release job targets only `linux/arm64` and the final `runtime` stage in `Dockerfile` and
+`examples/reference_bff/Dockerfile`. It prebuilds both OCI images with SBOM and maximum provenance
+before the first registry push, then authenticates only to
+`402906459349.dkr.ecr.ap-south-1.amazonaws.com`. The fixed repository mapping is:
+
+```text
+Dockerfile                         -> platform-infrastructure-production-identity-api
+examples/reference_bff/Dockerfile  -> platform-infrastructure-production-identity-bff
+```
+
+Every release tag contains the full source SHA, workflow run ID, and run attempt. The workflow uses
+the digests returned by the image builder, creates only digest-qualified references, binds GitHub
+provenance to each digest, and uploads one bounded JSON manifest for seven days. Operators must
+treat any failed or partial run as non-deployable even when one immutable digest was published.
+They must not discover a release later by tag or delete the partial image.
+
+The workflow does not read application secrets, call SSM, configure a host, run migrations, deploy
+containers, change DNS or Cognito, inspect traffic, or perform rollback. ECR scanning and a later
+digest-specific deployment decision remain separate infrastructure operations. Run
+`make release-workflow-check` locally to enforce the static contract; it is also part of
+`validate-offline` and the complete validation gate.
+
 ## Reference BFF operation
 
 The standalone BFF listens on 8081. Its liveness endpoint is process-only; readiness performs one
