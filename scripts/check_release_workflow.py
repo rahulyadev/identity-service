@@ -17,8 +17,8 @@ API_DOCKERFILE_PATH = ROOT / "Dockerfile"
 BFF_DOCKERFILE_PATH = ROOT / "examples" / "reference_bff" / "Dockerfile"
 
 BASE_IMAGE = (
-    "python:3.14.4-slim-bookworm@"
-    "sha256:fc74d22ffd0d5ac395a4b7bdda75a4539758862c49ebf3005647084631e63789"
+    "python:3.14.7-slim-bookworm@"
+    "sha256:416f0db2a2b561945630cef9877a7ea0581b27449eb9fd9df42f03e1b74b5b63"
 )
 QEMU_IMAGE = (
     "docker.io/tonistiigi/binfmt:qemu-v10.0.4@"
@@ -707,7 +707,7 @@ def _dockerfile_from_instructions(source: str) -> tuple[tuple[str, str | None], 
 
 
 def verify_dockerfile_sources(api_source: str, bff_source: str) -> None:
-    """Require the reviewed multi-architecture base in every external stage."""
+    """Freeze the base and image construction, including authentic inventory retention."""
 
     _expect(
         _dockerfile_from_instructions(api_source),
@@ -723,6 +723,18 @@ def verify_dockerfile_sources(api_source: str, bff_source: str) -> None:
         ((BASE_IMAGE, "runtime-dependencies"), (BASE_IMAGE, "runtime")),
         "bff-base-image",
     )
+    # Extra RUN/COPY/ADD instructions could erase, truncate or forge package metadata.
+    # Freeze the complete reviewed construction, not a blacklist of shell spellings.
+    # A Dockerfile change must deliberately update this source contract and its tests.
+    for source, expected in (
+        (api_source, "sha256:a21da99a677117200b0a6869d51c34184c5bf47d577d4c8c706cb4ffa082174b"),
+        (bff_source, "sha256:636cfe3e043f0a0114ee1804d5954928a9bde77e98947a8698d6ef1a661ec8aa"),
+    ):
+        _expect(
+            "sha256:" + hashlib.sha256(source.encode()).hexdigest(),
+            expected,
+            "dockerfile-inventory-construction",
+        )
 
 
 def verify_repository() -> dict[str, object]:

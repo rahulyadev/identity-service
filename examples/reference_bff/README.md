@@ -86,6 +86,17 @@ The packed runtime removes Python and operating-system package-manager tooling a
 dependencies are installed. Packed-image validation proves that boundary along with non-root,
 read-only, capability-dropped operation.
 
+It retains authentic root-controlled `/var/lib/dpkg` status and ownership records: metadata is
+data, not permission to install packages at runtime. The packed probe runs as UID/GID 10002,
+requires Python `3.14.7`, parses the database without apt/dpkg, and checks retained core libraries
+against package-owned files/checksums. Image SPDX Debian identities, versions and architectures
+must match that database; missing inventory cannot turn a zero-finding report into a security pass.
+Both stages use the same official Python `3.14.7-slim-bookworm` index and architecture pins as the
+API, documented in [container operation](../../docs/operations.md#container-operation). Local/CI
+validation intentionally retains the supported Python `3.14.4` toolchain minimum.
+Signed release provenance, complete inventory, vulnerability/vendor triage and deployment are
+separate gates; unresolved findings require explicit review, not silent suppression.
+
 ## Configuration boundary
 
 Configuration is supplied only through environment variables. `BFF_CLIENT_SECRET` and `REDIS_URL`

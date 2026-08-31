@@ -347,12 +347,12 @@ def test_yaml_ambiguity_and_non_string_commands_are_rejected(
 @pytest.mark.parametrize(
     ("path", "replacement"),
     (
-        (API_DOCKERFILE, "python:3.14.4-slim-bookworm"),
+        (API_DOCKERFILE, "python:3.14.7-slim-bookworm"),
         (API_DOCKERFILE, check_release_workflow.BASE_IMAGE.replace("python:", "mirror/python:")),
         (
             BFF_DOCKERFILE,
             check_release_workflow.BASE_IMAGE.replace(
-                "fc74d22ffd0d5ac395a4b7bdda75a4539758862c49ebf3005647084631e63789",  # pragma: allowlist secret  # noqa: E501
+                check_release_workflow.BASE_IMAGE.split("sha256:")[1],
                 "0" * 64,
             ),
         ),
@@ -369,6 +369,29 @@ def test_base_image_mutations_are_rejected(path: Path, replacement: str) -> None
 
     with pytest.raises(check_release_workflow.ContractError):
         check_release_workflow.verify_dockerfile_sources(api_source, bff_source)
+
+
+@pytest.mark.parametrize("image", ("api", "bff"))
+@pytest.mark.parametrize(
+    "instruction",
+    (
+        "RUN rm -rf /var/lib/dpkg",
+        "RUN rm /var/lib/dpkg/status",
+        "RUN truncate -s 0 /var/lib/dpkg/status",
+        "RUN sed -i '$d' /var/lib/dpkg/status",
+        "COPY synthetic-status /var/lib/dpkg/status",
+        "RUN cp /tmp/status /var/lib/dpkg/status",
+        "RUN chmod 666 /var/lib/dpkg/status",
+    ),
+)
+def test_inventory_source_mutations_fail_closed(image: str, instruction: str) -> None:
+    sources = {
+        "api": API_DOCKERFILE.read_text(encoding="utf-8"),
+        "bff": BFF_DOCKERFILE.read_text(encoding="utf-8"),
+    }
+    sources[image] = sources[image].replace("WORKDIR /app", instruction + "\nWORKDIR /app", 1)
+    with pytest.raises(check_release_workflow.ContractError):
+        check_release_workflow.verify_dockerfile_sources(sources["api"], sources["bff"])
 
 
 def test_cli_failure_is_short_and_value_free(
