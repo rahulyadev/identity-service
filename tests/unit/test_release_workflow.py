@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import shlex
 import shutil
 import subprocess
 import sys
+import textwrap
 from collections.abc import Callable
 from pathlib import Path
+from typing import cast
 
 import pytest
 import yaml  # type: ignore[import-untyped]
@@ -428,3 +431,305 @@ def test_disposable_cli_mutation_probes(
     assert result.stdout == ""
     assert result.stderr.startswith("release workflow contract failed: ")
     assert len(result.stderr) < 100
+
+
+BUILDER_GATE_NAME = "Verify ARM64 builder support"
+BUILD_STEP_NAMES = (
+    "Prebuild API ARM64 OCI image",
+    "Prebuild BFF ARM64 OCI image",
+    "Push API immutable image",
+    "Push BFF immutable image",
+)
+OBSERVED_BUILDER_PLATFORMS = "linux/amd64,linux/amd64/v2,linux/amd64/v3,linux/arm64,linux/386"
+MAXIMUM_BUILDER_PLATFORMS = (
+    "linux/amd64/v2," + "linux/amd64," * 335 + "linux/386," * 5 + "linux/arm64"
+)
+OLD_BUILDER_GATE = (
+    "docker buildx inspect --bootstrap --format "
+    "'{{range .Nodes}}{{join .Platforms \",\"}}{{end}}' "
+    "| grep -Eq '(^|,)linux/arm64(,|$)'\n"
+)
+
+
+def _release_step(workflow: dict[str, object], name: str) -> dict[str, object]:
+    jobs = workflow["jobs"]
+    assert isinstance(jobs, dict)
+    release = jobs["release"]
+    assert isinstance(release, dict)
+    steps = release["steps"]
+    assert isinstance(steps, list)
+    matching = [step for step in steps if isinstance(step, dict) and step.get("name") == name]
+    assert len(matching) == 1
+    return cast(dict[str, object], matching[0])
+
+
+def _execute_builder_gate(
+    tmp_path: Path, platforms: str | None, *, source: str = WORKFLOW_SOURCE
+) -> subprocess.CompletedProcess[str]:
+    # Parse, but do not run the digest verifier: behavior must independently reject bad gates.
+    workflow = check_release_workflow.parse_workflow_source(source)
+    defaults = workflow["defaults"]
+    assert isinstance(defaults, dict)
+    run_defaults = defaults["run"]
+    assert isinstance(run_defaults, dict)
+    shell = shlex.split(run_defaults["shell"])
+    assert shell == ["bash", "--noprofile", "--norc", "-euo", "pipefail", "{0}"]
+    gate = _release_step(workflow, BUILDER_GATE_NAME)
+    assert "if" not in gate
+    assert "continue-on-error" not in gate
+    assert gate["env"] == {"BUILDER_PLATFORMS": "${{ steps.buildx.outputs.platforms }}"}
+    command = gate["run"]
+    assert isinstance(command, str) and command
+
+    script = tmp_path / "gate.sh"
+    script.write_text(command, encoding="utf-8")
+    empty_bin = tmp_path / "empty-bin"
+    empty_bin.mkdir()
+    # No inherited credentials, BASH_ENV, Docker context, or executable external tools.
+    environment = {"PATH": str(empty_bin), "LC_ALL": "C"}
+    if platforms is not None:
+        environment["BUILDER_PLATFORMS"] = platforms
+    result = subprocess.run(
+        ["/bin/bash", *shell[1:-1], str(script)],
+        cwd=tmp_path,
+        env=environment,
+        stdin=subprocess.DEVNULL,
+        check=False,
+        capture_output=True,
+        text=True,
+        shell=False,
+        timeout=5,
+    )
+
+    assert not (tmp_path / "payload-executed").exists()
+    assert {path.name for path in tmp_path.iterdir()} == {"gate.sh", "empty-bin"}
+    assert not list(empty_bin.iterdir())
+    return result
+
+
+def _assert_builder_gate(
+    tmp_path: Path, platforms: str | None, accepted: bool, *, source: str = WORKFLOW_SOURCE
+) -> None:
+    result = _execute_builder_gate(tmp_path, platforms, source=source)
+    assert result.returncode == (0 if accepted else 1)
+    assert result.stdout == ""
+    if accepted:
+        assert result.stderr == ""
+    else:
+        assert result.stderr in {"invalid builder platforms\n", "ARM64 builder unavailable\n"}
+
+
+@pytest.mark.parametrize(
+    "platforms",
+    (
+        OBSERVED_BUILDER_PLATFORMS,
+        "linux/arm64",
+        "linux/arm64,linux/amd64",
+        "linux/amd64,linux/arm64,linux/386",
+        "linux/amd64,linux/386,linux/arm64",
+        "linux/arm/v7,linux/arm64,linux/riscv64",
+        MAXIMUM_BUILDER_PLATFORMS,
+    ),
+    ids=("observed-run", "arm64-only", "first", "middle", "last", "variants", "maximum-length"),
+)
+def test_actual_builder_gate_accepts_detected_arm64(platforms: str, tmp_path: Path) -> None:
+    assert len(MAXIMUM_BUILDER_PLATFORMS) == 4096
+    _assert_builder_gate(tmp_path, platforms, True)
+
+
+REJECTED_BUILDER_PLATFORMS: tuple[tuple[str, str | None], ...] = (
+    ("unset", None),
+    ("empty", ""),
+    ("amd64-only", "linux/amd64"),
+    ("amd64-variants-only", "linux/amd64,linux/amd64/v2,linux/386"),
+    ("leading-empty-token", ",linux/arm64"),
+    ("trailing-empty-token", "linux/arm64,"),
+    ("middle-empty-token", "linux/arm64,,linux/amd64"),
+    ("missing-os", "/arm64"),
+    ("missing-architecture", "linux/"),
+    ("malformed-with-arm64", "linux/arm64,invalid"),
+    ("extra-slash-with-arm64", "linux/arm64,linux/amd64//v3"),
+    ("wrong-os-case", "Linux/arm64"),
+    ("wrong-arch-case", "linux/ARM64"),
+    ("wrong-case-with-arm64", "linux/arm64,linux/AMD64"),
+    ("unicode-os-lookalike", "l\u0456nux/arm64"),
+    ("unicode-arch-lookalike", "linux/arm\uff16\uff14"),
+    ("os-prefix", "notlinux/arm64"),
+    ("arch-suffix", "linux/arm64evil"),
+    ("arch-numeric-suffix", "linux/arm640"),
+    ("variant-not-exact", "linux/arm64/v8"),
+    ("hyphen-suffix", "linux/arm64-v8"),
+    ("leading-space", " linux/arm64"),
+    ("trailing-space", "linux/arm64 "),
+    ("list-space", "linux/amd64, linux/arm64"),
+    ("tab", "linux/arm64\t"),
+    ("newline", "linux/arm64\n"),
+    ("crlf", "linux/arm64\r\n"),
+    ("multiline", "linux/arm64\nlinux/amd64"),
+    ("too-long", MAXIMUM_BUILDER_PLATFORMS + ",linux/amd64"),
+    ("semicolon", "linux/arm64; printf injected > payload-executed"),
+    ("substitution", "$(printf linux/arm64; printf injected > payload-executed)"),
+    ("appended-substitution", "linux/arm64$(printf injected > payload-executed)"),
+    ("backticks", "`printf linux/arm64; printf injected > payload-executed`"),
+    ("pipe", "linux/arm64|printf injected > payload-executed"),
+    ("logical-or", "linux/arm64||printf injected > payload-executed"),
+    ("background", "linux/arm64&printf injected > payload-executed"),
+    ("redirection", "linux/arm64>payload-executed"),
+    ("quoted-breakout", 'linux/arm64"; printf injected > payload-executed; #'),
+    ("glob", "linux/arm64*"),
+    ("parameter-expansion", "${BUILDER_PLATFORMS:-linux/arm64}"),
+)
+
+
+@pytest.mark.parametrize(
+    ("case", "platforms"),
+    REJECTED_BUILDER_PLATFORMS,
+    ids=[case for case, _ in REJECTED_BUILDER_PLATFORMS],
+)
+def test_actual_builder_gate_rejects_bad_output_value_free_without_execution(
+    case: str, platforms: str | None, tmp_path: Path
+) -> None:
+    del case
+    _assert_builder_gate(tmp_path, platforms, False)
+
+
+@pytest.mark.parametrize("codepoint", [*range(1, 32), 127, 128, 133, 159])
+def test_actual_builder_gate_rejects_control_characters(codepoint: int, tmp_path: Path) -> None:
+    _assert_builder_gate(tmp_path, f"linux/arm64,{chr(codepoint)}linux/amd64", False)
+
+
+def _step_source(source: str, name: str) -> str:
+    start = source.index(f"      - name: {name}\n")
+    end = source.find("      - name: ", start + 1)
+    return source[start : end if end != -1 else len(source)]
+
+
+def _replace_builder_gate(command: str) -> Callable[[str], str]:
+    def mutate(source: str) -> str:
+        gate = _release_step(
+            check_release_workflow.parse_workflow_source(source), BUILDER_GATE_NAME
+        )
+        original = gate["run"]
+        assert isinstance(original, str)
+        return replace_first(
+            textwrap.indent(original, " " * 10), textwrap.indent(command, " " * 10)
+        )(source)
+
+    return mutate
+
+
+def _remove_builder_gate(source: str) -> str:
+    return replace_first(_step_source(source, BUILDER_GATE_NAME), "")(source)
+
+
+def _move_builder_gate_after(name: str) -> Callable[[str], str]:
+    def mutate(source: str) -> str:
+        gate = _step_source(source, BUILDER_GATE_NAME)
+        without_gate = replace_first(gate, "")(source)
+        preceding = _step_source(without_gate, name)
+        return replace_first(preceding, preceding + gate)(without_gate)
+
+    return mutate
+
+
+BUILDER_MUTATIONS: tuple[tuple[str, Callable[[str], str]], ...] = (
+    ("unconditional-success", _replace_builder_gate("true\n")),
+    ("old-unsupported-command", _replace_builder_gate(OLD_BUILDER_GATE)),
+    ("removed-gate", _remove_builder_gate),
+    ("after-prebuild", _move_builder_gate_after("Prebuild API ARM64 OCI image")),
+    ("after-oidc", _move_builder_gate_after("Configure short-lived AWS credentials")),
+    (
+        "skip-gate",
+        replace_first(
+            f"      - name: {BUILDER_GATE_NAME}\n",
+            f"      - name: {BUILDER_GATE_NAME}\n        if: ${{{{ false }}}}\n",
+        ),
+    ),
+    (
+        "wrong-output-source",
+        replace_first(
+            "${{ steps.buildx.outputs.platforms }}", "${{ steps.other.outputs.platforms }}"
+        ),
+    ),
+    (
+        "wrong-output-field",
+        replace_first("${{ steps.buildx.outputs.platforms }}", "${{ steps.buildx.outputs.name }}"),
+    ),
+    (
+        "hardcoded-capability",
+        replace_first("${{ steps.buildx.outputs.platforms }}", "linux/arm64"),
+    ),
+    (
+        "direct-shell-interpolation",
+        replace_first("${BUILDER_PLATFORMS:-}", "${{ steps.buildx.outputs.platforms }}"),
+    ),
+    (
+        "forced-platforms-input",
+        replace_first(
+            "          version: v0.36.1\n",
+            "          version: v0.36.1\n          platforms: linux/arm64\n",
+        ),
+    ),
+    ("missing-version", replace_first("          version: v0.36.1\n", "")),
+    ("floating-version", replace_first("version: v0.36.1", "version: latest")),
+    ("changed-version", replace_first("version: v0.36.1", "version: v0.35.1")),
+    (
+        "continue-on-error",
+        replace_first(
+            f"      - name: {BUILDER_GATE_NAME}\n",
+            f"      - name: {BUILDER_GATE_NAME}\n        continue-on-error: true\n",
+        ),
+    ),
+)
+
+
+@pytest.mark.parametrize(
+    ("case", "mutation"), BUILDER_MUTATIONS, ids=[case for case, _ in BUILDER_MUTATIONS]
+)
+def test_builder_gate_contract_mutations_are_rejected(
+    case: str, mutation: Callable[[str], str]
+) -> None:
+    del case
+    with pytest.raises(check_release_workflow.ContractError):
+        check_release_workflow.verify_workflow_source(mutation(WORKFLOW_SOURCE))
+
+
+@pytest.mark.parametrize("name", BUILD_STEP_NAMES)
+def test_each_build_rejects_a_different_builder(name: str) -> None:
+    step = _step_source(WORKFLOW_SOURCE, name)
+    changed = replace_first("${{ steps.buildx.outputs.name }}", "${{ steps.other.outputs.name }}")(
+        step
+    )
+    with pytest.raises(check_release_workflow.ContractError):
+        check_release_workflow.verify_workflow_source(replace_first(step, changed)(WORKFLOW_SOURCE))
+
+
+@pytest.mark.parametrize(
+    ("mutation", "platforms", "accepted"),
+    (
+        (_replace_builder_gate("true\n"), "linux/amd64", False),
+        (_replace_builder_gate(OLD_BUILDER_GATE), "linux/arm64", True),
+        (BUILDER_MUTATIONS[5][1], "linux/arm64", True),
+        (_remove_builder_gate, "linux/arm64", True),
+    ),
+    ids=("unconditional-success", "unsupported-command", "skipped-gate", "removed-gate"),
+)
+def test_executable_proof_independently_detects_broken_gates(
+    mutation: Callable[[str], str], platforms: str, accepted: bool, tmp_path: Path
+) -> None:
+    with pytest.raises(AssertionError):
+        _assert_builder_gate(tmp_path, platforms, accepted, source=mutation(WORKFLOW_SOURCE))
+
+
+def test_builder_action_and_all_builds_share_the_detected_builder() -> None:
+    workflow = check_release_workflow.verify_repository()
+    setup = _release_step(workflow, "Set up pinned Buildx")
+    inputs = setup["with"]
+    assert isinstance(inputs, dict)
+    assert inputs["version"] == "v0.36.1"
+    assert "platforms" not in inputs
+    for name in BUILD_STEP_NAMES:
+        build_inputs = _release_step(workflow, name)["with"]
+        assert isinstance(build_inputs, dict)
+        assert build_inputs["builder"] == "${{ steps.buildx.outputs.name }}"
+    assert "docker buildx" not in WORKFLOW_SOURCE

@@ -151,7 +151,7 @@ RUN_DIGESTS = {
         "51e059ad31a96806bd378fefb09f79154d853e85f1df8e4da88355dccd55676d"  # pragma: allowlist secret  # noqa: E501
     ),
     ("release", "Verify ARM64 builder support"): (
-        "dd777e9035ebd028a5314fe7c9cbb22c3f3df7dadfdd426f761645ac2a1cc802"  # pragma: allowlist secret  # noqa: E501
+        "da5d3734f1991cb69e2d2889379cd33be0338b7d176a71705e0921d6f91e3301"  # pragma: allowlist secret  # noqa: E501
     ),
     ("release", "Validate API digest"): (
         "b6bd5ecc600ab13b7d6a41816ed04b6f22f899712142a4f3e8f85f4244eb5cdc"  # pragma: allowlist secret  # noqa: E501
@@ -208,6 +208,7 @@ RUN_METADATA = {
     ("release", "Verify ARM64 builder support"): {
         "name": "Verify ARM64 builder support",
         "timeout-minutes": 2,
+        "env": {"BUILDER_PLATFORMS": "${{ steps.buildx.outputs.platforms }}"},
     },
     ("release", "Validate API digest"): {
         "name": "Validate API digest",
@@ -456,6 +457,7 @@ def _expected_action_steps() -> dict[tuple[str, str], dict[str, object]]:
             "docker/setup-buildx-action",
             5,
             {
+                "version": "v0.36.1",
                 "driver": "docker-container",
                 "driver-opts": f"image={BUILDKIT_IMAGE}",
                 "install": False,
