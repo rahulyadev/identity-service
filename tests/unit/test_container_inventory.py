@@ -30,13 +30,28 @@ CORE_PACKAGES = (
 )
 
 
-@pytest.fixture
-def inventory_root(tmp_path: Path) -> Path:
-    database = tmp_path / "var/lib/dpkg"
-    (database / "info").mkdir(parents=True)
-    library = tmp_path / "usr/lib/synthetic"
-    library.mkdir(parents=True)
-    (tmp_path / "etc/ld.so.conf.d").mkdir(parents=True)
+def write_fixture_file(path: Path, contents: bytes) -> None:
+    path.write_bytes(contents)
+    path.chmod(0o600)
+
+
+def create_inventory_fixture(root: Path) -> Path:
+    root.chmod(0o700)
+    for relative_directory in (
+        "var",
+        "var/lib",
+        "var/lib/dpkg",
+        "var/lib/dpkg/info",
+        "usr",
+        "usr/lib",
+        "usr/lib/synthetic",
+        "etc",
+        "etc/ld.so.conf.d",
+    ):
+        directory = root / relative_directory
+        directory.mkdir(mode=0o700)
+        directory.chmod(0o700)
+    database = root / "var/lib/dpkg"
     records = []
     for name in (*CORE_PACKAGES, "synthetic-data"):
         records.append(
@@ -46,14 +61,22 @@ def inventory_root(tmp_path: Path) -> Path:
         )
         relative = f"usr/lib/synthetic/{name}.so.1"
         contents = b"\x7fELFsynthetic-not-executable-" + name.encode()
-        (tmp_path / relative).write_bytes(contents)
-        (database / "info" / (name + ":amd64.list")).write_text(
-            "/etc/ld.so.conf.d\n/" + relative + "\n"
+        write_fixture_file(root / relative, contents)
+        write_fixture_file(
+            database / "info" / (name + ":amd64.list"),
+            ("/etc/ld.so.conf.d\n/" + relative + "\n").encode(),
         )
         digest = hashlib.md5(contents, usedforsecurity=False).hexdigest()
-        (database / "info" / (name + ":amd64.md5sums")).write_text(f"{digest}  {relative}\n")
-    (database / "status").write_text("".join(records))
-    return tmp_path
+        write_fixture_file(
+            database / "info" / (name + ":amd64.md5sums"), f"{digest}  {relative}\n".encode()
+        )
+    write_fixture_file(database / "status", "".join(records).encode())
+    return root
+
+
+@pytest.fixture
+def inventory_root(tmp_path: Path) -> Path:
+    return create_inventory_fixture(tmp_path)
 
 
 def execute_probe(root: Path, owner_uid: int | None = None) -> subprocess.CompletedProcess[str]:
@@ -94,13 +117,73 @@ def fixture_sbom(inventory: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def test_real_probe_reconciles_files_database_and_sbom(inventory_root: Path) -> None:
-    result = execute_probe(inventory_root)
+def pristine_inventory(root: Path) -> dict[str, Any]:
+    result = execute_probe(root)
     assert result.returncode == 0, result.stderr
     inventory = json.loads(result.stdout)
     assert {p["name"] for p in inventory["packages"]} == {*CORE_PACKAGES, "synthetic-data"}
     assert all(p["libraries"] for p in inventory["packages"] if p["name"] in CORE_PACKAGES)
     bff_smoke.verify_inventory_sbom(inventory, fixture_sbom(inventory))
+    return inventory
+
+
+def test_real_probe_reconciles_files_database_and_sbom(inventory_root: Path) -> None:
+    pristine_inventory(inventory_root)
+
+
+@pytest.mark.parametrize("mask", (0o002, 0o022, 0o077), ids=("0002", "0022", "0077"))
+@pytest.mark.parametrize("fail_scope", (False, True), ids=("normal", "exception"))
+def test_fixture_permissions_ignore_umask_and_restore_isolated_scope(
+    tmp_path: Path, mask: int, fail_scope: bool
+) -> None:
+    # Only this child changes its umask; neither pytest nor its caller is modified.
+    source = """
+import json
+import os
+from pathlib import Path
+import runpy
+import stat
+import sys
+
+helpers = runpy.run_path(sys.argv[1])
+root = Path(sys.argv[2])
+mask = int(sys.argv[3])
+fail_scope = sys.argv[4] == "True"
+
+class ExpectedScopeError(Exception):
+    pass
+
+original = os.umask(mask)
+try:
+    helpers["create_inventory_fixture"](root)
+    for path in (root, *root.rglob("*")):
+        info = path.lstat()
+        assert stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)
+        expected = 0o700 if stat.S_ISDIR(info.st_mode) else 0o600
+        assert stat.S_IMODE(info.st_mode) == expected, (path, oct(info.st_mode))
+        assert info.st_uid == os.getuid() and info.st_gid == os.getgid()
+    helpers["pristine_inventory"](root)
+    if fail_scope:
+        raise ExpectedScopeError
+except ExpectedScopeError:
+    assert fail_scope
+finally:
+    assert os.umask(original) == mask
+restored = os.umask(original)
+assert restored == original
+print(json.dumps({"original": original, "restored": restored, "mask": mask}))
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", source, __file__, str(tmp_path), str(mask), str(fail_scope)],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+    observed = json.loads(result.stdout)
+    assert observed["mask"] == mask
+    assert observed["restored"] == observed["original"]
 
 
 @pytest.mark.parametrize(
@@ -131,6 +214,7 @@ def test_actual_probe_rejects_incomplete_or_uncontrolled_inventory(
     inventory_root: Path,
     mutation: str,
 ) -> None:
+    pristine_inventory(inventory_root)
     database = inventory_root / "var/lib/dpkg"
     status = database / "status"
     source = status.read_text()
@@ -140,9 +224,10 @@ def test_actual_probe_rejects_incomplete_or_uncontrolled_inventory(
     if mutation in {"missing", "directory", "symlink"}:
         status.unlink()
         if mutation == "directory":
-            status.mkdir()
+            status.mkdir(mode=0o700)
+            status.chmod(0o700)
         if mutation == "symlink":
-            (database / "copied-status").write_text(source)
+            write_fixture_file(database / "copied-status", source.encode())
             status.symlink_to("copied-status")
     elif mutation == "empty":
         status.write_text("")
@@ -181,6 +266,28 @@ def test_actual_probe_rejects_incomplete_or_uncontrolled_inventory(
     result = execute_probe(inventory_root, owner)
     assert result.returncode != 0
     assert result.stdout == ""
+    expected_failure = {
+        "missing": "FileNotFoundError",
+        "empty": "metadata-size",
+        "directory": "metadata-control",
+        "symlink": "metadata-control",
+        "truncated": "status-truncated",
+        "missing-field": "status-required-fields",
+        "duplicate-field": "duplicate-field",
+        "duplicate-package": "duplicate-package",
+        "missing-core": "core-package-coverage",
+        "orphan-package": "orphan-package-ownership",
+        "writable": "metadata-control",
+        "wrong-owner": "metadata-control",
+        "missing-list": "ownership-list",
+        "empty-list": "metadata-size",
+        "missing-library": "retained-library-missing",
+        "changed-library": "library-checksum",
+        "missing-checksum": "FileNotFoundError",
+        "bad-checksum": "file-checksum-record",
+        "nul": "metadata-framing",
+    }[mutation]
+    assert expected_failure in result.stderr.splitlines()[-1]
 
 
 @pytest.mark.parametrize("mutation", ("empty", "omission", "version", "arch", "duplicate", "purl"))
@@ -188,7 +295,7 @@ def test_sbom_catalog_omission_and_misbinding_are_not_clean(
     inventory_root: Path,
     mutation: str,
 ) -> None:
-    inventory = json.loads(execute_probe(inventory_root).stdout)
+    inventory = pristine_inventory(inventory_root)
     sbom = fixture_sbom(inventory)
     if mutation == "empty":
         sbom["packages"] = []
