@@ -122,3 +122,28 @@ belong to `platform-infrastructure`. This repository performs no cloud administr
 The repository generates a CycloneDX inventory of the locked Python runtime dependencies. That
 inventory excludes development-only packages and does not represent container or operating-system
 packages; an image-level SBOM remains an infrastructure/release concern.
+
+## Image inventory and vulnerability gates
+
+Release signatures and provenance establish artifact/source binding, not absence of vulnerabilities.
+Python dependency audits cover the locked Python distributions, not Debian libraries or all code
+bundled in wheels. Image inventory, vulnerability classification and deployment authorization are
+separate requirements. A reported zero with missing OS package metadata is incomplete coverage,
+not a clean scan.
+
+The API and BFF preserve authentic DPKG status, ownership and version records even where runtime
+package-manager executables are removed. Executable packed checks reject empty, truncated,
+uncontrolled or incomplete metadata and compare retained core shared-library bytes with the
+package-owned checksum records. DPKG's MD5 records serve file-to-package reconciliation, not image
+authenticity; immutable SHA-256 image digests and signed release provenance provide that binding.
+SPDX OS identities, versions and architectures must reconcile with the actual packed inventory.
+See [container operation](operations.md#container-operation) for the exact base/source/architecture
+pins and the deliberate runtime-patch versus validation-toolchain distinction.
+
+Keep complete scanner findings, including unfixed and unknown entries, together with scanner
+identity, vulnerability-database build time/checksum, source image digest and vendor advisories.
+Classify each finding using the installed binary/source package and Debian's backported version,
+not upstream version ordering alone. A generic severity does not establish application
+exploitability; unused-by-design code is not by itself proof of absence or non-applicability.
+Vendor-unfixed residuals remain visible for explicit risk review. Neither successful signing,
+passing Python audits nor restored SBOM coverage independently authorizes runtime deployment.

@@ -15,7 +15,9 @@ import time
 import uuid
 from collections.abc import Mapping
 from pathlib import Path
+from typing import Any
 
+from examples.reference_bff.scripts.container_smoke import inventory_probe_source
 from scripts.check_sbom import LOCK_ENTRY, locked_components, normalize_name
 from tests.fixtures.fake_cognito import FakeCognito
 from tests.fixtures.fake_cognito_server import FakeCognitoServer
@@ -48,6 +50,28 @@ COMMON_JSON_LOG_FIELDS = {
 MAX_RAW_RESPONSE_BYTES = 16 * 1024
 RAW_STATUS = re.compile(rb"HTTP/1\.[01] ([1-5][0-9]{2}) ")
 SECURITY_DISTRIBUTIONS = ("PyJWT", "cryptography", "httpx2")
+
+
+def verify_packed_inventory() -> dict[str, Any]:
+    """Run the shared inventory gate as the configured non-root API user."""
+    inventory: dict[str, Any] = json.loads(
+        run(
+            "docker",
+            "compose",
+            "exec",
+            "-T",
+            "app",
+            "python",
+            "-c",
+            inventory_probe_source(),
+            capture=True,
+        )
+    )
+    if inventory["python"] != "3.14.7" or inventory["owner_uid"] != 0:
+        raise RuntimeError("packed API inventory/runtime differs")
+    return inventory
+
+
 RAW_HTTP_CASES = (
     (
         "conflicting_content_length",
@@ -972,6 +996,7 @@ def main() -> int:
             )
         if tooling["security_dependencies"] != expected_security_dependencies:
             raise RuntimeError("packed runtime security dependencies do not match the lock")
+        verify_packed_inventory()
 
         artifact_probe = (
             "import json\n"

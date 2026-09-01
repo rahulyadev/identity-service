@@ -82,10 +82,31 @@ log attribute `error_code` is not exposed in problem JSON or OpenAPI.
 
 ## Container operation
 
-The image pins Python `3.14.4`, runs UID/GID 10001, writes no bytecode, and needs only an explicitly
+The image pins Python `3.14.7`, runs UID/GID 10001, writes no bytecode, and needs only an explicitly
 mounted writable `/tmp`; the root filesystem can be read-only. It runs one Uvicorn process, disables
 Uvicorn proxy-header interpretation, and handles SIGTERM through the configured graceful timeout.
 Alembic is never an application entrypoint side effect.
+
+Both dependency and runtime stages of the API and BFF use the official
+`python:3.14.7-slim-bookworm@sha256:416f0db2a2b561945630cef9877a7ea0581b27449eb9fd9df42f03e1b74b5b63`
+multi-architecture index. Its Linux child manifests are:
+
+- amd64: `sha256:6e9a7d1f48cf0127a5be29b58dba0c7f1b59c118619f011b7a6fca28d00adfd4`.
+- arm64/v8: `sha256:4ef8fbc5d4e068625ed1abfb3c83fd937293c9a68e29e344175c7cb291f1365c`.
+
+The [official Docker Python source](https://github.com/docker-library/python/blob/228f71e70a42ba9f9a092321b971031603bb88ff/3.14/slim-bookworm/Dockerfile)
+binds this patch release to its build recipe. Local and CI validation retain Python `3.14.4` as
+the supported minimum/toolchain; the production image patch is deliberately newer. Packed checks
+verify the actual `3.14.7` runtime rather than inferring it from a tag. A base refresh requires
+fresh image-level inventory, SBOM, provenance, scans and functional validation for both images.
+The release verifier freezes the complete Dockerfiles as well as their base stages, so added
+construction commands cannot silently remove, truncate or replace package metadata.
+
+Both images retain the authentic root-controlled `/var/lib/dpkg` database and ownership/checksum
+records. Packed validation parses that data without invoking a package manager and reconciles
+retained core shared libraries with their package records. Image-level SPDX validation compares
+every Debian package identity, version and architecture against the actual database, rejecting
+catalog omissions. Removing BFF apt/dpkg executables does not remove this inventory requirement.
 
 The local Compose database is PostgreSQL `18.4-bookworm`. Its credentials and roles are disposable
 local examples only. `make docker-smoke` starts the database, migrates explicitly, starts the packed

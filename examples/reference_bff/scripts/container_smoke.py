@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import http.client
+import inspect
 import json
 import os
 import re
@@ -20,7 +21,7 @@ from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, quote, urlsplit
+from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 import jwt
 from cryptography.hazmat.primitives.asymmetric import rsa
@@ -51,6 +52,216 @@ PROFILE_DOCUMENT = {
     "created_at": "2026-08-25T00:00:00+00:00",
     "updated_at": "2026-08-25T00:00:00+00:00",
 }
+
+
+def container_inventory(root: str = "/", owner_uid: int = 0) -> dict[str, Any]:
+    """Read authentic DPKG data without package-manager executables.
+
+    This self-contained function is also the code executed inside both packed images.
+    The alternate root/owner are solely for executable synthetic regression fixtures.
+    DPKG MD5 values reconcile files to package records, not cryptographic image trust.
+    """
+    import hashlib
+    import platform
+    import re
+    import stat
+    from pathlib import Path
+
+    def require(condition: bool, code: str) -> None:
+        if not condition:
+            raise RuntimeError("container inventory failed: " + code)
+
+    base = Path(root).resolve(strict=True)
+
+    def controlled(path: Path, directory: bool = False) -> None:
+        info = path.lstat()
+        require(
+            (stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode))
+            and info.st_uid == owner_uid
+            and info.st_gid == owner_uid
+            and not info.st_mode & 0o022,
+            "metadata-control",
+        )
+        if not directory:
+            require(0 < info.st_size <= 8 * 1024 * 1024, "metadata-size")
+
+    def data(path: Path) -> str:
+        controlled(path)
+        text = path.read_bytes().decode("utf-8")
+        require("\x00" not in text and "\r" not in text and text.endswith("\n"), "metadata-framing")
+        return text
+
+    database = base / "var/lib/dpkg"
+    for name in ("var", "var/lib", "var/lib/dpkg", "var/lib/dpkg/info"):
+        controlled(base / name, directory=True)
+    status = data(database / "status")
+    require(status.endswith("\n\n"), "status-truncated")
+    packages: list[dict[str, Any]] = []
+    keys: set[tuple[str, str]] = set()
+    expected_lists: set[str] = set()
+    core = {
+        "libc6",
+        "libssl3",
+        "libgnutls30",
+        "libbz2-1.0",
+        "libffi8",
+        "liblzma5",
+        "libsqlite3-0",
+        "libuuid1",
+        "zlib1g",
+        "libstdc++6",
+        "libgcc-s1",
+        "libcrypt1",
+    }
+    for paragraph in status.removesuffix("\n\n").split("\n\n"):
+        fields: dict[str, str] = {}
+        previous = ""
+        for line in paragraph.splitlines():
+            if line.startswith((" ", "\t")):
+                require(bool(previous), "orphan-continuation")
+                fields[previous] += "\n" + line
+                continue
+            match = re.fullmatch(r"([A-Za-z][A-Za-z0-9-]*): ?(.*)", line)
+            require(match is not None, "status-field")
+            if match is None:
+                raise RuntimeError("container inventory failed: status-field")
+            previous, value = match.groups()
+            require(
+                previous.casefold() not in {key.casefold() for key in fields}, "duplicate-field"
+            )
+            fields[previous] = value
+        require(
+            {"Package", "Version", "Architecture", "Status"} <= fields.keys(),
+            "status-required-fields",
+        )
+        name, version, arch = (fields[key] for key in ("Package", "Version", "Architecture"))
+        require(re.fullmatch(r"[a-z0-9][a-z0-9+.-]+", name) is not None, "package-name")
+        require(re.fullmatch(r"[0-9][A-Za-z0-9.+:~\-]*", version) is not None, "package-version")
+        require(arch in {"all", "amd64", "arm64"}, "package-architecture")
+        require(fields["Status"] == "install ok installed", "package-state")
+        require((name, arch) not in keys, "duplicate-package")
+        keys.add((name, arch))
+        choices = [database / "info" / (stem + ".list") for stem in (name, name + ":" + arch)]
+        lists = [path for path in choices if path.exists() or path.is_symlink()]
+        require(len(lists) == 1, "ownership-list")
+        ownership = lists[0]
+        expected_lists.add(ownership.name)
+        paths = data(ownership).splitlines()
+        require(
+            all(path.startswith("/") and ".." not in Path(path).parts for path in paths)
+            and len(paths) == len(set(paths)),
+            "ownership-path",
+        )
+        libraries: list[dict[str, str]] = []
+        if name in core:
+            checksums: dict[str, str] = {}
+            for line in data(ownership.with_suffix(".md5sums")).splitlines():
+                match = re.fullmatch(r"([a-f0-9]{32})  (.+)", line)
+                require(match is not None, "file-checksum-record")
+                if match is None:
+                    raise RuntimeError("container inventory failed: file-checksum-record")
+                digest, relative = match.groups()
+                require(relative not in checksums, "duplicate-file-checksum")
+                checksums[relative] = digest
+            for installed in paths:
+                if re.search(r"\.so(?:\.[0-9]+)*$", Path(installed).name) is None:
+                    continue
+                path = base / installed.lstrip("/")
+                require(path.exists(), "retained-library-missing")
+                resolved = path.resolve(strict=True)
+                require(resolved.is_relative_to(base), "library-path-escape")
+                if path.is_symlink():
+                    continue
+                controlled(path)
+                contents = path.read_bytes()
+                require(contents.startswith(b"\x7fELF"), "library-format")
+                expected = checksums.get(installed.lstrip("/"))
+                require(
+                    expected is not None
+                    and hashlib.md5(contents, usedforsecurity=False).hexdigest() == expected,
+                    "library-checksum",
+                )
+                libraries.append(
+                    {"path": installed, "sha256": hashlib.sha256(contents).hexdigest()}
+                )
+            require(bool(libraries), "core-library-coverage")
+        packages.append(
+            {
+                "name": name,
+                "version": version,
+                "architecture": arch,
+                "source": fields.get("Source", name),
+                "libraries": libraries,
+            }
+        )
+    require(core <= {package["name"] for package in packages}, "core-package-coverage")
+    require(
+        {path.name for path in (database / "info").glob("*.list")} == expected_lists,
+        "orphan-package-ownership",
+    )
+    return {
+        "status_sha256": hashlib.sha256(status.encode()).hexdigest(),
+        "status_bytes": len(status.encode()),
+        "owner_uid": owner_uid,
+        "python": platform.python_version(),
+        "machine": platform.machine(),
+        "packages": sorted(
+            packages, key=lambda package: (package["name"], package["architecture"])
+        ),
+    }
+
+
+def inventory_probe_source(root: str = "/", owner_uid: int = 0) -> str:
+    """Emit the actual fixed, shell-free packed probe (fixture arguments are test-only)."""
+    return (
+        "import json\nfrom typing import Any\n"
+        + inspect.getsource(container_inventory)
+        + f"\nprint(json.dumps(container_inventory({root!r}, {owner_uid!r}),sort_keys=True))\n"
+    )
+
+
+def verify_inventory_sbom(inventory: dict[str, Any], sbom: dict[str, Any]) -> None:
+    """Require identity/version/architecture equality, not merely a nonzero OS count."""
+    expected = {
+        (package["name"], package["version"], package["architecture"])
+        for package in inventory["packages"]
+    }
+    actual: list[tuple[str, str, str]] = []
+    for package in sbom.get("packages", []):
+        for reference in package.get("externalRefs", []):
+            locator = reference.get("referenceLocator", "")
+            if reference.get("referenceType") != "purl" or not locator.startswith("pkg:deb/"):
+                continue
+            parsed = urlsplit(locator)
+            name_version = parsed.path.removeprefix("deb/debian/").split("@")
+            qualifiers = parse_qs(parsed.query, strict_parsing=True)
+            if (
+                not parsed.path.startswith("deb/debian/")
+                or len(name_version) != 2
+                or set(qualifiers.get("arch", [])) not in ({"all"}, {"amd64"}, {"arm64"})
+            ):
+                raise RuntimeError("container SBOM failed: package-identity")
+            name, version = (unquote(value) for value in name_version)
+            if name != package.get("name") or version != package.get("versionInfo"):
+                raise RuntimeError("container SBOM failed: package-version")
+            actual.append((name, version, qualifiers["arch"][0]))
+    if (
+        sbom.get("spdxVersion") != "SPDX-2.3"
+        or not expected
+        or len(actual) != len(set(actual))
+        or set(actual) != expected
+    ):
+        raise RuntimeError("container SBOM failed: OS-catalog-coverage")
+
+
+def verify_packed_inventory() -> dict[str, Any]:
+    """Run the inventory gate as the configured non-root BFF user."""
+    inventory: dict[str, Any] = json.loads(
+        run(*COMPOSE, "exec", "-T", "bff", "python", "-c", inventory_probe_source())
+    )
+    if inventory["python"] != "3.14.7" or inventory["owner_uid"] != 0:
+        raise RuntimeError("packed BFF inventory/runtime differs")
+    return inventory
 
 
 def base64url_uint(value: int) -> str:
@@ -735,6 +946,7 @@ def main() -> int:
             raise RuntimeError("packed BFF contains a forbidden package boundary")
         if any(tooling["paths"].values()):
             raise RuntimeError("packed BFF contains development or deployment tooling")
+        verify_packed_inventory()
 
         live_status, live_headers, live_body = request("/health/live")
         if live_status != 200 or live_body != b'{"status":"alive"}':
