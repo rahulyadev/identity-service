@@ -128,3 +128,48 @@ denial/no-mutation, normalized update and clear, stable session-cookie renewal,
 CAS/non-resurrection/lock cleanup, provider/Identity/Redis outages and recovery, inspects the
 server-side session, and then removes the disposable stack. Production secrets and real provider
 access are not needed.
+
+### Callback token rejection diagnostics
+
+A callback rejected by token verification emits one `callback_token_rejected` warning in either
+configured log format. Its `category` is a closed, value-free enum; its `request_id` is a fresh
+server-generated UUIDv4 (hex), also used in the existing problem body and `X-Request-ID` response
+header. `/auth/callback` ignores all supplied request IDs. Other endpoints retain their existing
+bounded request-ID behavior. Categories remain internal: public authentication failures still
+return HTTP 400 `authentication_failed`, clear the OAuth binding cookie, and never bootstrap an
+identity or create a session. Dependency/key unavailability retains HTTP 503 and emits no token
+rejection event.
+
+| Category | First rejecting check |
+| --- | --- |
+| `id_format`, `access_format` | Token shape, canonical base64url, strict bounded JSON |
+| `id_header`, `access_header` | Allowed header fields, algorithm, key identifier shape, type |
+| `id_signing_key`, `access_signing_key` | Definitively unknown signing key |
+| `id_signature`, `access_signature` | Signature mismatch |
+| `id_required_claim`, `access_required_claim` | Pinned verifier's required-claim check |
+| `id_issuer`, `access_issuer` | Expected issuer |
+| `id_audience`, `access_audience` | Exact client/resource audience |
+| `id_token_use`, `access_token_use` | Expected token use |
+| `id_time`, `access_time` | Typed library time failure or local strict date/order checks |
+| `id_subject`, `access_subject` | Subject type/shape |
+| `id_family`, `access_family` | Token-family identifier or token identifier type/presence/shape |
+| `id_nonce` | Nonce binding |
+| `access_client`, `access_scope` | Access client binding or scope grammar/required set |
+| `subject_continuity`, `family_continuity` | Pair/refresh continuity |
+| `id_at_hash`, `refresh_format` | Access-token hash or refresh-token shape |
+| `id_verification`, `access_verification` | Ambiguous library failure or strict-decoder disagreement |
+| `verification` | Unknown/malformed diagnostic category |
+
+ID/access context comes from the verifier call site, never an unverified claim. Existing validation
+order is preserved, so an access signature failure precedes the later pair nonce check. PyJWT's
+`DecodeError` and builtin exceptions can represent multiple failures (including some malformed
+dates); they intentionally use the fixed verification fallback. Messages are never parsed to
+infer a more specific reason. Redundant local guards remain even when the pinned library normally
+rejects first.
+
+The diagnostic formatter constructs an allowlisted envelope before serialization. It includes
+operational log time/level/service metadata and the fixed event/category/generated correlation,
+with no exception text, stack, arbitrary extras, tokens, claim values/times, caller identifiers,
+provider bodies or query URLs. Malformed diagnostic fields use fixed fallbacks. These categories
+make a future callback observable; synthetic tests cannot identify the cause of a real provider
+rejection.

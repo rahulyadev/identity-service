@@ -14,6 +14,11 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.requests import ClientDisconnect
 from starlette.responses import JSONResponse, RedirectResponse, Response
 
+from reference_bff.auth_diagnostics import (
+    CALLBACK_REJECTION_EVENT,
+    CallbackRejection,
+    safe_category,
+)
 from reference_bff.callback import (
     OAUTH_BINDING_COOKIE_NAME,
     CallbackDenied,
@@ -338,6 +343,16 @@ def create_app(
         try:
             session = await service.complete(callback_query.code, transaction)
         except CallbackFlowError as error:
+            if error.status == 400 and error.code == "authentication_failed":
+                logging.getLogger("reference_bff.http").warning(
+                    CALLBACK_REJECTION_EVENT,
+                    extra={
+                        "callback_rejection": CallbackRejection(
+                            safe_category(error.category),
+                            request.scope.get("state", {}).get("callback_request_id"),
+                        )
+                    },
+                )
             failure_response = problem_response(
                 error.status, error.code, get_request_id(request.scope)
             )

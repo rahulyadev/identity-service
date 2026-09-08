@@ -143,15 +143,16 @@ def test_lock_wrapper_check_mode_resolves_twice_without_subprocesses(
         source.write_text(f"input:{input_name}\n")
         destination = root / output_name
         destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_text(f"generated:{output_name}\n")
+        destination.write_text("idna==3.18 --hash=sha256:" + "a" * 64 + "\n")
 
-    def fake_compile_all(directory: Path) -> None:
+    def fake_compile_all(directory: Path, *, check: bool = False) -> None:
+        assert check is True
         observed.append(directory)
         for input_name, output_name in compile_locks.LOCKS:
             assert (directory / input_name).read_text() == f"input:{input_name}\n"
             destination = directory / output_name
             destination.parent.mkdir(parents=True, exist_ok=True)
-            destination.write_text(f"generated:{output_name}\n")
+            destination.write_text("idna==3.18 --hash=sha256:" + "a" * 64 + "\n")
 
     monkeypatch.setattr(compile_locks, "ROOT", root)
     monkeypatch.setattr(compile_locks, "_compile_all", fake_compile_all)
@@ -175,9 +176,10 @@ def test_lock_wrapper_check_mode_rejects_byte_drift(
         source.write_text(f"input:{input_name}\n")
         destination = root / output_name
         destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_text(f"generated:{output_name}\n")
+        destination.write_text("idna==3.18 --hash=sha256:" + "a" * 64 + "\n")
 
-    def fake_compile_all(directory: Path) -> None:
+    def fake_compile_all(directory: Path, *, check: bool = False) -> None:
+        assert check is True
         nonlocal invocation
         invocation += 1
         for _, output_name in compile_locks.LOCKS:
@@ -193,7 +195,7 @@ def test_lock_wrapper_check_mode_rejects_byte_drift(
 
     assert compile_locks.check_locks() == 1
     assert capsys.readouterr().out == (
-        "requirements.lock differs between independent fresh resolutions\n"
+        "requirements.lock differs between independent locked resolutions\n"
     )
 
 

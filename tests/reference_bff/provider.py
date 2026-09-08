@@ -31,6 +31,8 @@ class SyntheticProvider:
         default_factory=lambda: rsa.generate_private_key(65537, 2048)
     )
     key_id: str = "synthetic-key-1"
+    access_private_key: rsa.RSAPrivateKey | None = field(default=None, repr=False)
+    access_key_id: str = "synthetic-access-key"
     subject: str = "synthetic-cognito-subject"
     code: str = "synthetic-authorization-code"
     refresh_token: str = "synthetic-refresh-token-value"
@@ -115,9 +117,12 @@ class SyntheticProvider:
                 "token_use": "access",
                 "scope": " ".join(self.settings.requested_scopes),
             },
-            self.private_key,
+            self.access_private_key or self.private_key,
             algorithm="RS256",
-            headers={"kid": self.key_id, "typ": "at+jwt"},
+            headers={
+                "kid": self.access_key_id if self.access_private_key is not None else self.key_id,
+                "typ": "at+jwt",
+            },
         )
         digest = hashlib.sha256(access_token.encode()).digest()[:16]
         at_hash = base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
@@ -137,13 +142,15 @@ class SyntheticProvider:
         )
         return access_token, id_token
 
-    def public_jwk(self) -> dict[str, Any]:
-        numbers = self.private_key.public_key().public_numbers()
+    def public_jwk(self, *, access: bool = False) -> dict[str, Any]:
+        key = self.access_private_key if access else self.private_key
+        assert key is not None
+        numbers = key.public_key().public_numbers()
         return {
             "kty": "RSA",
             "use": "sig",
             "alg": "RS256",
-            "kid": self.key_id,
+            "kid": self.access_key_id if access else self.key_id,
             "n": _base64url_uint(numbers.n),
             "e": _base64url_uint(numbers.e),
             "key_ops": ["verify"],
@@ -152,7 +159,10 @@ class SyntheticProvider:
     def handle(self, request: httpx2.Request) -> httpx2.Response:
         if str(request.url) == self.settings.cognito_jwks_url and request.method == "GET":
             self.events.append("jwks")
-            document = self.jwks_document or {"keys": [self.public_jwk()]}
+            keys = [self.public_jwk()]
+            if self.access_private_key is not None:
+                keys.append(self.public_jwk(access=True))
+            document = self.jwks_document or {"keys": keys}
             return httpx2.Response(
                 self.jwks_status,
                 request=request,

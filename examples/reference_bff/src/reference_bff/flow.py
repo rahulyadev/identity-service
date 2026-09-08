@@ -7,6 +7,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Protocol
 
+from reference_bff.auth_diagnostics import TokenFailureCategory
 from reference_bff.config import Settings
 from reference_bff.exchange import AuthorizationCodeClient, CodeExchangeUnavailableError
 from reference_bff.http import AsyncUpstreamClient
@@ -26,6 +27,7 @@ from reference_bff.transactions import AuthorizationTransaction
 class CallbackFlowError(Exception):
     status: int
     code: str
+    category: TokenFailureCategory | None = None
 
 
 class CallbackCompleter(Protocol):
@@ -74,8 +76,8 @@ class CallbackFlow:
                 refresh_token=exchanged.refresh_token,
                 expected_nonce=transaction.nonce,
             )
-        except InvalidProviderTokenError:
-            raise CallbackFlowError(400, "authentication_failed") from None
+        except InvalidProviderTokenError as error:
+            raise CallbackFlowError(400, "authentication_failed", error.category) from None
         except TokenVerificationUnavailableError:
             raise CallbackFlowError(503, "authentication_unavailable") from None
         try:

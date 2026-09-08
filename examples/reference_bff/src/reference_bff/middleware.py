@@ -8,6 +8,7 @@ import uuid
 
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from reference_bff.auth_diagnostics import CallbackRequestId
 from reference_bff.problems import problem_response
 
 REQUEST_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,63}")
@@ -83,10 +84,12 @@ class SecurityBoundaryMiddleware:
             await self._app(scope, receive, send)
             return
         headers = list(scope.get("headers", []))
-        request_id = _request_id(headers)
+        callback_id = CallbackRequestId() if scope.get("path") == "/auth/callback" else None
+        request_id = callback_id.value if callback_id is not None else _request_id(headers)
         state = scope.setdefault("state", {})
         if isinstance(state, dict):
             state["request_id"] = request_id
+            state["callback_request_id"] = callback_id
 
         async def send_with_headers(message: Message) -> None:
             if message["type"] == "http.response.start":
