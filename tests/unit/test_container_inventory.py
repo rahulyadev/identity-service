@@ -27,6 +27,7 @@ CORE_PACKAGES = (
     "libstdc++6",
     "libgcc-s1",
     "libcrypt1",
+    "libpcre2-8-0",
 )
 
 
@@ -54,9 +55,10 @@ def create_inventory_fixture(root: Path) -> Path:
     database = root / "var/lib/dpkg"
     records = []
     for name in (*CORE_PACKAGES, "synthetic-data"):
+        version = "10.42-1+deb12u1" if name == "libpcre2-8-0" else "1:2.3-4+deb12u1"
         records.append(
             f"Package: {name}\nStatus: install ok installed\nArchitecture: amd64\n"
-            "Version: 1:2.3-4+deb12u1\nConffiles:\n /etc/synthetic fixture-checksum\n"
+            f"Version: {version}\nConffiles:\n /etc/synthetic fixture-checksum\n"
             "Description: synthetic fixture\n continuation\n\n"
         )
         relative = f"usr/lib/synthetic/{name}.so.1"
@@ -337,3 +339,31 @@ def test_both_packed_gates_execute_the_shared_probe(
         with pytest.raises(RuntimeError, match="inventory/runtime differs"):
             module.verify_packed_inventory()
     assert len(calls) == 1
+
+
+@pytest.mark.parametrize("version", ("10.42-1", "10.42-1+deb12u2", "10.48-1"))
+def test_real_probe_rejects_unreviewed_pcre2_version(inventory_root: Path, version: str) -> None:
+    status = inventory_root / "var/lib/dpkg/status"
+    status.write_text(status.read_text().replace("10.42-1+deb12u1", version))
+    result = execute_probe(inventory_root)
+    assert result.returncode != 0
+    assert "pcre2-fixed-version" in result.stderr
+
+
+@pytest.mark.parametrize("mutation", ("library", "checksum", "ownership", "package"))
+def test_real_probe_rejects_incomplete_pcre2_evidence(inventory_root: Path, mutation: str) -> None:
+    pristine_inventory(inventory_root)
+    database = inventory_root / "var/lib/dpkg"
+    if mutation == "library":
+        (inventory_root / "usr/lib/synthetic/libpcre2-8-0.so.1").write_bytes(b"\x7fELFtampered")
+    elif mutation == "checksum":
+        (database / "info/libpcre2-8-0:amd64.md5sums").unlink()
+    elif mutation == "ownership":
+        (database / "info/libpcre2-8-0:amd64.list").unlink()
+    else:
+        status = database / "status"
+        paragraphs = status.read_text().split("\n\n")
+        status.write_text(
+            "\n\n".join(p for p in paragraphs if not p.startswith("Package: libpcre2-8-0\n"))
+        )
+    assert execute_probe(inventory_root).returncode != 0

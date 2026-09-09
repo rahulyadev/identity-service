@@ -220,3 +220,19 @@ requirements; no alternate JWT implementation is present.
 This repository documents schema compatibility and supplies migrations. `platform-infrastructure`
 owns production backup scheduling, encryption, retention, restore execution, and restore drills.
 Application operators must verify the restored Alembic revision before declaring readiness.
+
+### Exact Debian runtime correction
+
+The runtime stages apply one package-managed Bookworm-security correction: `libpcre2-8-0`
+`10.42-1` to `10.42-1+deb12u1`, before the BFF removes package-manager executables.
+The reviewed amd64 and ARM64 package hashes are embedded in both Dockerfiles; the fixed URL,
+architecture selection, checksum verification and exact before/after version checks fail closed.
+There is no general APT upgrade or dependency refresh. The base digest and all Python inputs
+and locks remain separate controls; use `make lock-check` to verify them.
+
+Review both actual ARM64 candidates with original SPDX and maximum provenance, all 97 Debian
+identities, unchanged Python distributions and authenticated package-file hashes. Only PCRE2's
+package version and package-managed contents change; DPKG transaction records and the libc
+linker-cache trigger may update generated metadata without upgrading libc. Keep unfiltered
+scanner results and database identity. A failed or overdue scan remains recorded even after a
+later successful scan; a rescan does not extend an exception or authorize deployment.

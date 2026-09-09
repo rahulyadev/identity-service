@@ -727,8 +727,8 @@ def verify_dockerfile_sources(api_source: str, bff_source: str) -> None:
     # Freeze the complete reviewed construction, not a blacklist of shell spellings.
     # A Dockerfile change must deliberately update this source contract and its tests.
     for source, expected in (
-        (api_source, "sha256:a21da99a677117200b0a6869d51c34184c5bf47d577d4c8c706cb4ffa082174b"),
-        (bff_source, "sha256:636cfe3e043f0a0114ee1804d5954928a9bde77e98947a8698d6ef1a661ec8aa"),
+        (api_source, "sha256:d618f583a6f9a302ad4811e68d2e0a658d770283940912cbe3004671750b9d4e"),
+        (bff_source, "sha256:1edaad3499f4dfccdb77668aabb941d282891425a7e5d3f8462572d2b88a14eb"),
     ):
         _expect(
             "sha256:" + hashlib.sha256(source.encode()).hexdigest(),

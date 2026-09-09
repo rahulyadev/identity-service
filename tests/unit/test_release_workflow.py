@@ -756,3 +756,36 @@ def test_builder_action_and_all_builds_share_the_detected_builder() -> None:
         assert isinstance(build_inputs, dict)
         assert build_inputs["builder"] == "${{ steps.buildx.outputs.name }}"
     assert "docker buildx" not in WORKFLOW_SOURCE
+
+
+@pytest.mark.parametrize("image", ("api", "bff"))
+@pytest.mark.parametrize(
+    ("before", "after"),
+    (
+        ("10.42-1+deb12u1", "10.42-1"),
+        ("10.42-1+deb12u1", "10.42-1+deb12u2"),
+        ("https://security.debian.org/debian-security/", "https://unreviewed.invalid/"),
+        ("dpkg --install /tmp/libpcre2-8-0.deb", "apt-get upgrade -y"),
+        (
+            "dpkg --install /tmp/libpcre2-8-0.deb",
+            "dpkg --force-depends --install /tmp/libpcre2-8-0.deb",
+        ),
+        ("assert hashlib.sha256(data).hexdigest() == expected", "assert data"),
+        ("*) exit 1 ;;", "*) checksum=unreviewed ;;"),
+        ("USER 10001:10001", "USER 0:0"),
+        ("USER 10002:10002", "USER 0:0"),
+    ),
+)
+def test_exact_package_transaction_and_hardening_fail_closed(
+    image: str, before: str, after: str
+) -> None:
+    sources = {
+        "api": API_DOCKERFILE.read_text(encoding="utf-8"),
+        "bff": BFF_DOCKERFILE.read_text(encoding="utf-8"),
+    }
+    if before.startswith("USER "):
+        before = "USER 10001:10001" if image == "api" else "USER 10002:10002"
+    assert before in sources[image]
+    sources[image] = sources[image].replace(before, after)
+    with pytest.raises(check_release_workflow.ContractError):
+        check_release_workflow.verify_dockerfile_sources(sources["api"], sources["bff"])

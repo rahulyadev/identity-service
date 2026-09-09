@@ -112,6 +112,7 @@ def container_inventory(root: str = "/", owner_uid: int = 0) -> dict[str, Any]:
         "libstdc++6",
         "libgcc-s1",
         "libcrypt1",
+        "libpcre2-8-0",
     }
     for paragraph in status.removesuffix("\n\n").split("\n\n"):
         fields: dict[str, str] = {}
@@ -138,6 +139,8 @@ def container_inventory(root: str = "/", owner_uid: int = 0) -> dict[str, Any]:
         require(re.fullmatch(r"[a-z0-9][a-z0-9+.-]+", name) is not None, "package-name")
         require(re.fullmatch(r"[0-9][A-Za-z0-9.+:~\-]*", version) is not None, "package-version")
         require(arch in {"all", "amd64", "arm64"}, "package-architecture")
+        if name == "libpcre2-8-0":
+            require(version == "10.42-1+deb12u1", "pcre2-fixed-version")
         require(fields["Status"] == "install ok installed", "package-state")
         require((name, arch) not in keys, "duplicate-package")
         keys.add((name, arch))
