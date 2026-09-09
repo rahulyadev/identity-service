@@ -40,7 +40,7 @@ jobs:
 
       - name: Verify dependency locks are reproducible
         run: |
-          make lock
+          make lock-check
           git diff --exit-code -- requirements.lock requirements-dev.lock examples/reference_bff/requirements.lock
 
       - name: Format, lint, and type-check

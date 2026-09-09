@@ -54,7 +54,16 @@ make sync
 `requirements.lock` is the Identity production dependency set.
 `examples/reference_bff/requirements.lock` is the separate BFF production dependency set.
 `requirements-dev.lock` contains the combined exact validation toolchain. Regenerate all three
-with `make lock` and review the diff.
+with `make lock` and review the diff as explicit dependency maintenance. Generation resolves from
+the declared inputs without existing lock seeds, so newer compatible versions may be selected.
+
+`make lock-check` verifies all three reviewed resolutions in two disposable workspaces. The pinned
+compiler seeds existing versions without upgrading and independently regenerates hashes with hash
+reuse disabled. Both outputs must exactly match each other and the repository locks, including
+headers and dependency annotations. Unsafe seed directives and external compiler configuration are
+rejected or disabled. This checks locked reproducibility, not whether every version is the latest
+available release. Dependency audits, hash-required installation, compatibility and SBOM checks
+remain separate mandatory checks. Check mode never updates dependency inputs or locks.
 
 ## Local PostgreSQL and application
 
@@ -84,7 +93,7 @@ make db-down
 
 ```text
 make sync              install the hash-locked development set locally
-make lock-check        compare both locks with fresh hash-locked resolutions
+make lock-check        verify all three locked resolutions with independently regenerated hashes
 make pip-check         verify the installed environment is consistent
 make format            format and apply safe lint fixes
 make format-check      check formatting without changes

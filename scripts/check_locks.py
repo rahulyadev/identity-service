@@ -1,4 +1,4 @@
-"""Verify exact dependency locks through the canonical compile wrapper."""
+"""Verify locked reproducibility and regenerated hashes through the canonical compiler."""
 
 from scripts.compile_locks import check_locks
 
