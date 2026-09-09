@@ -147,3 +147,17 @@ not upstream version ordering alone. A generic severity does not establish appli
 exploitability; unused-by-design code is not by itself proof of absence or non-applicability.
 Vendor-unfixed residuals remain visible for explicit risk review. Neither successful signing,
 passing Python audits nor restored SBOM coverage independently authorizes runtime deployment.
+
+Both runtime images install only the official Bookworm-security `libpcre2-8-0`
+`10.42-1+deb12u1` package over the pinned base's `10.42-1`. Architecture-specific SHA-256
+checks bind the downloads to reviewed Debian InRelease/Packages metadata authenticated with
+the base's Debian archive keyring. Unsupported architectures, changed download bytes and failed
+package transactions stop the build. DPKG performs the installation and library-cache trigger;
+its authentic status, ownership and checksum records remain. Packed checks require the reviewed
+version and reconcile PCRE2 library bytes with package metadata alongside the other core libraries.
+The full Dockerfile construction contract still rejects unreviewed additions or inventory edits.
+
+This backport addresses [CVE-2026-86145](https://security-tracker.debian.org/tracker/CVE-2026-86145)
+in recursive DFA matching. It does not establish remediation of other image findings or transfer
+any vulnerability acceptance to another digest. A local candidate scan is distinct from a released
+image's ECR scan, and neither constitutes authorization to publish or deploy.
